@@ -4,10 +4,9 @@ import datetime
 import pytz
 import base64
 import re
-import os
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-NOTION_TOKEN = os.environ["NOTION_TOKEN"]
+NOTION_TOKEN = "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"
 NOTION_DB_ID = "39575f5d-f642-810e-854e-c80528128539"
 
 CATEGORIES = [
@@ -22,7 +21,7 @@ def write_expense_to_notion(date_str, vendor, amount, category, biz_or_personal,
         "Content-Type": "application/json",
         "Notion-Version": "2022-06-28",
     }
-
+    
     properties = {
         "Date": {"date": {"start": date_str}},
         "Vendor": {"rich_text": [{"text": {"content": vendor}}]},
@@ -31,20 +30,20 @@ def write_expense_to_notion(date_str, vendor, amount, category, biz_or_personal,
         "Business or Personal": {"select": {"name": biz_or_personal}},
         "Source": {"select": {"name": source}}
     }
-
+    
     if note:
         properties["Note"] = {"rich_text": [{"text": {"content": note}}]}
-
+        
     if image_url:
         properties["Receipt Image"] = {"files": [{"type": "external", "name": "receipt.jpg", "external": {"url": image_url}}]}
-
+        
     payload = {
         "parent": {"database_id": NOTION_DB_ID},
         "properties": properties
     }
-
+    
     try:
-        response = requests.post("https://api.notion.com/v1/pages", headers=headers, json=payload, timeout=15 )
+        response = requests.post("https://api.notion.com/v1/pages", headers=headers, json=payload, timeout=15)
         response.raise_for_status()
         return response.json()
     except Exception as e:
@@ -56,6 +55,7 @@ def write_expense_to_notion(date_str, vendor, amount, category, biz_or_personal,
 def build_category_keyboard(prefix, current_page=0):
     """Build an inline keyboard for selecting a category."""
     markup = InlineKeyboardMarkup()
+    # For simplicity in Telegram, we can show all 10 categories in 2 columns
     row = []
     for i, cat in enumerate(CATEGORIES):
         row.append(InlineKeyboardButton(cat, callback_data=f"{prefix}_cat_{cat}"))
@@ -119,23 +119,25 @@ def extract_receipt_data_with_claude(client, img_b64):
                 ]
             }]
         )
-
+        
         raw = resp.content[0].text.strip()
+        # Clean up markdown if Claude included it despite instructions
         if raw.startswith("```json"):
             raw = raw[7:]
         if raw.endswith("```"):
             raw = raw[:-3]
-
+            
         json_match = re.search(r'\{.*\}', raw, re.DOTALL)
         if not json_match:
             return None
-
+            
         return json.loads(json_match.group())
     except Exception as e:
         print(f"Claude extraction error: {e}")
         return None
 
 # State management for multi-step flows
+# Keys will be chat_id
 expense_states = {}
 
 def get_state(chat_id):
@@ -150,14 +152,41 @@ def clear_state(chat_id):
 def upload_file_to_notion_or_imgur(img_data):
     """
     Notion API doesn't support direct file uploads via the public API for the 'files' property.
-    We upload to Imgur and store the resulting URL in the Receipt Image property.
+    We must provide an external URL. We'll use a free image host like Imgur for this bot.
     """
     try:
+        # Using a public client ID for Imgur anonymous uploads (temporary solution)
         headers = {"Authorization": "Client-ID 8a93649479261cb"}
         payload = {"image": base64.b64encode(img_data).decode("utf-8")}
-        response = requests.post("https://api.imgur.com/3/image", headers=headers, data=payload, timeout=15 )
+        response = requests.post("https://api.imgur.com/3/image", headers=headers, data=payload, timeout=15)
         if response.status_code == 200:
             return response.json()["data"]["link"]
     except Exception as e:
         print(f"Error uploading image: {e}")
     return None
+
+def has_expense_today():
+    """Query the WEFT Expenses Notion DB for any entries logged today (ET). Returns bool."""
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28",
+    }
+    today = datetime.datetime.now(pytz.timezone('US/Eastern')).strftime("%Y-%m-%d")
+    payload = {
+        "filter": {
+            "property": "Date",
+            "date": {"equals": today}
+        },
+        "page_size": 1
+    }
+    try:
+        response = requests.post(
+            f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
+            headers=headers, json=payload, timeout=10
+        )
+        data = response.json()
+        return len(data.get("results", [])) > 0
+    except Exception as e:
+        print(f"Notion today-check error: {e}")
+        return False  # fail open — send the reminder if unsure
