@@ -16,7 +16,8 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from notion_expenses import (
     write_expense_to_notion, extract_receipt_data_with_claude,
     build_category_keyboard, build_biz_personal_keyboard, build_confirmation_keyboard,
-    get_state, clear_state, upload_file_to_notion_or_imgur, has_expense_today
+    get_state, clear_state, upload_file_to_notion_or_imgur, has_expense_today,
+    write_task_to_notion, get_open_tasks_from_notion, mark_tasks_done_in_notion
 )
 
 # --- CONFIGURATION ---
@@ -167,16 +168,9 @@ def safe_send(chat_id, text):
         print(f"Error sending message: {e}")
 
 def get_unchecked_tasks():
-    res = sheets_get("Tasks")
-    unchecked = []
-    if "data" in res and "values" in res["data"]:
-        rows = res["data"]["values"]
-        for i, row in enumerate(rows[1:], 1):
-            status = row[2] if len(row) > 2 else ""
-            task = row[1] if len(row) > 1 else ""
-            if status != "Done" and task:
-                unchecked.append((i, task))
-    return unchecked
+    tasks = get_open_tasks_from_notion()
+    # return list of (index, task_name) to match previous signature
+    return [(i+1, t["name"]) for i, t in enumerate(tasks)]
 
 # --- FEATURE 1: PANTRY HELPERS ---
 
@@ -401,7 +395,8 @@ def send_welcome(message):
         "/plan - Sunday planning session\n"
         "/tasks - List your tasks\n"
         "/top3 - Your 3 most urgent pending tasks\n"
-        "/addtask [task] - Add a task\n"
+        "/transition - One concrete next action\n"
+        "/addtask [task] - Add a task (supports multiple lines)\n"
         "/done 1 3 4 - Mark tasks done\n"
         "/brain [thoughts] - Dump and organize\n"
         "/stuck - ADHD reset\n"
@@ -800,80 +795,57 @@ def fridge_handler(message):
 @bot.message_handler(commands=['addtask'])
 def add_task(message):
     set_last_chat_id(message.chat.id)
-    task_name = message.text.replace('/addtask', '').strip()
-    if not task_name:
-        safe_send(message.chat.id, "Try: /addtask Finish the mockup")
+    text = message.text.replace('/addtask', '').strip()
+    if not text:
+        safe_send(message.chat.id, "Try: /addtask Finish the mockup\n(Or send multiple lines to add multiple tasks)")
         return
-    date = datetime.datetime.now(est).strftime("%Y-%m-%d")
-    sheets_append("Tasks", [[date, task_name, "Pending", "", "FALSE"]])
-    safe_send(message.chat.id, f"Added: {task_name}. Get it done.")
+    
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    if len(lines) == 1:
+        write_task_to_notion(lines[0])
+        safe_send(message.chat.id, f"Added: {lines[0]}. Get it done.")
+    else:
+        for line in lines:
+            write_task_to_notion(line)
+        safe_send(message.chat.id, f"Added {len(lines)} tasks to Notion. Get them done.")
 
 @bot.message_handler(commands=['tasks'])
 def list_tasks(message):
     set_last_chat_id(message.chat.id)
-    today_str = datetime.datetime.now(est).strftime("%Y-%m-%d")
-    res = sheets_get("Tasks")
-
-    rows = res.get("data", {}).get("values", []) if "data" in res else []
-    if not rows or len(rows) <= 1:
-        safe_send(message.chat.id, "No tasks yet. Add one with /addtask")
+    tasks = get_open_tasks_from_notion()
+    
+    if not tasks:
+        safe_send(message.chat.id, "No open tasks. Add one with /addtask")
         return
 
-    today_tasks = []
-    carried = []
-    done_tasks = []
+    lines = []
+    for i, t in enumerate(tasks, 1):
+        prefix = f"[{t['priority']}] " if t['priority'] else ""
+        lines.append(f"{i}. {prefix}{t['name']}")
 
-    for i, row in enumerate(rows[1:], 1):
-        date_added = row[0] if len(row) > 0 else ""
-        task = row[1] if len(row) > 1 else ""
-        status = row[2] if len(row) > 2 else ""
-        carried_over = row[4] if len(row) > 4 else ""
-
-        if not task:
-            continue
-        if status == "Done":
-            done_tasks.append(f"  {i}. {task}")
-        elif date_added == today_str:
-            today_tasks.append(f"  {i}. {task}")
-        elif carried_over == "TRUE":
-            carried.append(f"  {i}. {task}")
-
-    response = f"TODAY'S TASKS - {today_str}\n\n"
-    if today_tasks:
-        response += "Pending:\n" + "\n".join(today_tasks) + "\n"
-    if carried:
-        response += "\nCarried over:\n" + "\n".join(carried) + "\n"
-    if done_tasks:
-        response += "\nCompleted today:\n" + "\n".join(done_tasks) + "\n"
-    if not today_tasks and not carried and not done_tasks:
-        response += "No tasks. Add one with /addtask"
-
+    response = "OPEN TASKS\n\n" + "\n".join(lines)
     safe_send(message.chat.id, response)
 
 @bot.message_handler(commands=['top3'])
 def top3_tasks(message):
     """Return the 3 most urgent pending tasks as a focused list."""
     set_last_chat_id(message.chat.id)
-    res = sheets_get("Tasks")
-    rows = res.get("data", {}).get("values", []) if "data" in res else []
-    if not rows or len(rows) <= 1:
-        safe_send(message.chat.id, "No tasks yet. Add one with /addtask")
-        return
-
-    pending = []
-    for i, row in enumerate(rows[1:], 1):
-        task = row[1] if len(row) > 1 else ""
-        status = row[2] if len(row) > 2 else ""
-        if task and status != "Done":
-            pending.append((i, task))
-
-    if not pending:
+    tasks = get_open_tasks_from_notion()
+    
+    if not tasks:
         safe_send(message.chat.id, "All tasks done. Add new ones with /addtask")
         return
 
-    top = pending[:3]
-    lines = "\n".join([f"{j+1}. {t[1]}" for j, t in enumerate(top)])
-    safe_send(message.chat.id, f"TOP 3\n\n{lines}\n\nLock in. Get these done.")
+    # Sort by priority weight descending, then keep original order (oldest first)
+    sorted_tasks = sorted(tasks, key=lambda x: x["priority_weight"], reverse=True)
+    top = sorted_tasks[:3]
+    
+    lines = []
+    for j, t in enumerate(top, 1):
+        prefix = f"[{t['priority']}] " if t['priority'] else ""
+        lines.append(f"{j}. {prefix}{t['name']}")
+        
+    safe_send(message.chat.id, f"TOP 3\n\n{chr(10).join(lines)}\n\nLock in. Get these done.")
 
 
 @bot.message_handler(commands=['done'])
@@ -886,40 +858,49 @@ def mark_done(message):
         safe_send(message.chat.id, "Try: /done 1 3 4")
         return
 
-    res = sheets_get("Tasks")
-    if "data" not in res or "values" not in res.get("data", {}):
-        safe_send(message.chat.id, "Error retrieving tasks.")
+    tasks = get_open_tasks_from_notion()
+    if not tasks:
+        safe_send(message.chat.id, "No open tasks to mark done.")
         return
 
-    rows = res["data"]["values"]
-    today_str = datetime.datetime.now(est).strftime("%Y-%m-%d")
-    updates = []
-
+    page_ids_to_mark = []
+    completed_names = []
     for num in nums:
-        if 1 <= num < len(rows):
-            row_index = num + 1
-            updates.append({"range": f"Tasks!C{row_index}", "values": [["Done"]]})
-            updates.append({"range": f"Tasks!D{row_index}", "values": [[today_str]]})
+        if 1 <= num <= len(tasks):
+            t = tasks[num-1]
+            page_ids_to_mark.append(t["id"])
+            completed_names.append(t["name"])
 
-    if updates:
-        sheets_batch_update(updates)
-
-        remaining = []
-        for i, row in enumerate(rows[1:], 1):
-            status = row[2] if len(row) > 2 else ""
-            task = row[1] if len(row) > 1 else ""
-            if status != "Done" and i not in nums and task:
-                remaining.append(f"  {i}. {task}")
-
-        response = f"Checked off {', '.join(map(str, nums))} - lets go Keem.\n\n"
+    if page_ids_to_mark:
+        success_count = mark_tasks_done_in_notion(page_ids_to_mark)
+        
+        remaining = [t for i, t in enumerate(tasks, 1) if i not in nums]
+        
+        response = f"Checked off {success_count} tasks - lets go Keem.\n\n"
         if remaining:
-            response += f"{len(remaining)} left:\n" + "\n".join(remaining) + "\n\nKeep pushing."
+            lines = [f"  {i+1}. {t['name']}" for i, t in enumerate(remaining)]
+            response += f"{len(remaining)} left:\n" + "\n".join(lines) + "\n\nKeep pushing."
         else:
             response += "All done! Great work today."
 
         safe_send(message.chat.id, response)
     else:
         safe_send(message.chat.id, "No valid task numbers found.")
+
+@bot.message_handler(commands=['transition'])
+def transition_action(message):
+    set_last_chat_id(message.chat.id)
+    tasks = get_open_tasks_from_notion()
+    
+    if not tasks:
+        safe_send(message.chat.id, "Next: take a breath. No open tasks right now.")
+        return
+
+    # Sort by priority weight descending, then original order (oldest first)
+    sorted_tasks = sorted(tasks, key=lambda x: x["priority_weight"], reverse=True)
+    next_task = sorted_tasks[0]
+    
+    safe_send(message.chat.id, f"Next: {next_task['name']}")
 
 @bot.message_handler(commands=['focus'])
 def focus_mode(message):
@@ -1449,6 +1430,15 @@ def reminder_945pm():
 def reminder_10pm():
     daily_reminder("Phone down. No screen. Read something. Tomorrow starts tonight.")
 
+def reminder_11am_win():
+    daily_reminder("Log a win — what went right today so far? Use /wins")
+
+def reminder_3pm_win():
+    daily_reminder("Quick one — anything worth logging as a win right now? Use /wins")
+
+def reminder_8pm_win():
+    daily_reminder("Before you wind down — log today's wins with /wins")
+
 def reminder_830am_tasks():
     chat_id = get_last_chat_id()
     if not chat_id:
@@ -1504,6 +1494,9 @@ def run_scheduler():
     t_7pm,    _       = _utc(19, 0)
     t_945pm,  _       = _utc(21, 45)
     t_10pm,   _       = _utc(22, 0)
+    t_11am,   _       = _utc(11, 0)
+    t_3pm,    _       = _utc(15, 0)
+    t_8pm,    _       = _utc(20, 0)
     t_mon8am, _       = _utc(8,  0)
     t_sat12,  _       = _utc(12, 0)
     t_sun15,  _       = _utc(15, 0)
@@ -1521,6 +1514,10 @@ def run_scheduler():
     schedule.every().day.at(t_7pm).do(reminder_7pm)
     schedule.every().day.at(t_945pm).do(reminder_945pm)
     schedule.every().day.at(t_10pm).do(reminder_10pm)
+    
+    schedule.every().day.at(t_11am).do(reminder_11am_win)
+    schedule.every().day.at(t_3pm).do(reminder_3pm_win)
+    schedule.every().day.at(t_8pm).do(reminder_8pm_win)
 
     # Weekly
     schedule.every().monday.at(t_mon8am).do(send_weekly_email)
@@ -1534,15 +1531,18 @@ def run_scheduler():
         schedule.every().sunday.at(t_reset).do(sunday_reset_reminder)
     reset_day_label = "Mon" if shifted else "Sun"
 
-    print(f"\nScheduler running — 13 jobs ({tz_name} = UTC{offset:+d})")
+    print(f"\nScheduler running — 16 jobs ({tz_name} = UTC{offset:+d})")
     print(f"  {t_7am} UTC  = 07:00 {tz_name}  Daily ginger shot")
     print(f"  {t_730am} UTC  = 07:30 {tz_name}  Eat breakfast")
     print(f"  {t_8am} UTC  = 08:00 {tz_name}  Gym / walk")
     print(f"  {t_830am} UTC  = 08:30 {tz_name}  Top 3 tasks")
     print(f"  {t_9am} UTC  = 09:00 {tz_name}  Subscription check")
+    print(f"  {t_11am} UTC  = 11:00 {tz_name}  Log a win (morning)")
     print(f"  {t_1pm} UTC  = 13:00 {tz_name}  Lunch")
+    print(f"  {t_3pm} UTC  = 15:00 {tz_name}  Log a win (afternoon)")
     print(f"  {t_7pm} UTC  = 19:00 {tz_name}  Dinner")
-    print(f"  {t_945pm} UTC  = 21:45 {tz_name}  Night ginger shot")
+    print(f"  {t_8pm} UTC  = 20:00 {tz_name}  Log a win (evening)")
+    print(f"  {t_945pm} UTC  = 21:45 {tz_name}  Night ginger shot + expense check")
     print(f"  {t_10pm} UTC  = 22:00 {tz_name}  Phone down")
     print(f"  Mon {t_mon8am} UTC  = Mon 08:00 {tz_name}  Weekly email")
     print(f"  Sat {t_sat12} UTC  = Sat 12:00 {tz_name}  Ginger batch")
