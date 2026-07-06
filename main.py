@@ -12,6 +12,12 @@ import base64
 import schedule
 import anthropic
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from notion_expenses import (
+    write_expense_to_notion, extract_receipt_data_with_claude,
+    build_category_keyboard, build_biz_personal_keyboard, build_confirmation_keyboard,
+    get_state, clear_state, upload_file_to_notion_or_imgur, has_expense_today
+)
 
 # --- CONFIGURATION ---
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -227,9 +233,15 @@ def deduct_pantry_item(chat_id, item_name):
 # --- FEATURE 1: RECEIPT PHOTO SCANNING ---
 
 @bot.message_handler(content_types=['photo'])
-def handle_photo(message):
+def handle_photo(message, caption=None):
+    """Handle a photo message — triggers Notion expense receipt flow."""
     set_last_chat_id(message.chat.id)
-    safe_send(message.chat.id, "Got your photo. Scanning receipt...")
+    chat_id = message.chat.id
+
+    # Accept a caption passed programmatically (e.g. from /spent reply)
+    note = caption if caption else (message.caption.strip() if message.caption else "")
+
+    status_msg = bot.send_message(chat_id, "\U0001f4f8 Scanning receipt with Claude Vision...")
 
     try:
         file_id = message.photo[-1].file_id
@@ -238,69 +250,82 @@ def handle_photo(message):
         img_data = requests.get(file_url, timeout=15).content
         img_b64 = base64.standard_b64encode(img_data).decode("utf-8")
 
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        resp = client.messages.create(
-            model="claude-opus-4-5",
-            max_tokens=1024,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": img_b64
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            "This is a receipt photo. Extract and return ONLY a JSON object with these fields:\n"
-                            "- store: store name (string)\n"
-                            "- total: total amount as a number (no $ sign)\n"
-                            "- category: one of food, clothing, supplies, tech, other\n"
-                            "- food_items: array of objects with 'name' and 'quantity' for any food/grocery items found\n"
-                            "Return only valid JSON, no explanation."
-                        )
-                    }
-                ]
-            }]
-        )
+        # Upload image for Notion attachment
+        image_url = upload_file_to_notion_or_imgur(img_data)
 
-        raw = resp.content[0].text.strip()
-        json_match = re.search(r'\{.*\}', raw, re.DOTALL)
-        if not json_match:
-            safe_send(message.chat.id, "Could not read the receipt. Try a clearer photo.")
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        data = extract_receipt_data_with_claude(client, img_b64)
+
+        if not data:
+            bot.edit_message_text(
+                "\u274c Could not parse the receipt. Try a clearer photo or use /spent.",
+                chat_id, status_msg.message_id
+            )
             return
 
-        data = json.loads(json_match.group())
-        store = data.get("store", "Unknown store")
-        total = data.get("total", 0)
-        category = data.get("category", "other")
-        food_items = data.get("food_items", [])
+        # Store state for the multi-step confirmation flow
+        clear_state(chat_id)
+        state = get_state(chat_id)
+        state['flow'] = 'photo'
+        state['source'] = 'Receipt Photo'
+        state['vendor'] = data.get('vendor', 'Unknown Vendor')
+        state['amount'] = data.get('amount', 0)
+        state['date'] = data.get('date', datetime.datetime.now(est).strftime("%Y-%m-%d"))
+        state['category'] = data.get('category', 'Other')
+        state['note'] = note
+        state['image_url'] = image_url
 
-        date = datetime.datetime.now(est).strftime("%Y-%m-%d")
-        sheets_append("Spent", [[date, store, category, str(total), "Receipt photo"]])
+        summary = (
+            f"Extracted from receipt:\n"
+            f"Vendor: {state['vendor']}\n"
+            f"Amount: ${state['amount']}\n"
+            f"Date: {state['date']}\n"
+            f"Category: {state['category']}\n\n"
+            f"Does this look right?"
+        )
 
-        added_items = []
-        for fi in food_items:
-            name = fi.get("name", "")
-            qty = fi.get("quantity", 1)
-            if name:
-                update_pantry_item(name, qty)
-                added_items.append(f"{name} x{qty}")
+        markup = build_confirmation_keyboard("rec")
+        bot.edit_message_text(summary, chat_id, status_msg.message_id, reply_markup=markup)
 
-        reply = f"Logged — ${total} at {store} ({category})."
-        if added_items:
-            reply += f" Added to pantry: {', '.join(added_items)}."
-        safe_send(message.chat.id, reply)
-
-    except json.JSONDecodeError:
-        safe_send(message.chat.id, "Scanned but could not parse the receipt. Try a clearer photo.")
     except Exception as e:
         print(f"Receipt scan error: {e}")
-        safe_send(message.chat.id, f"Error scanning receipt: {e}")
+        bot.edit_message_text(f"\u274c Error scanning receipt: {e}", chat_id, status_msg.message_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('rec_'))
+def process_receipt_callback(call):
+    """Handle inline button callbacks from the receipt confirmation flow."""
+    chat_id = call.message.chat.id
+    state = get_state(chat_id)
+    action = call.data[len('rec_'):]
+
+    if action == 'confirm_yes':
+        bot.edit_message_text("Confirmed. Is this Business or Personal?", chat_id, call.message.message_id,
+                              reply_markup=build_biz_personal_keyboard("exp"))
+
+    elif action == 'confirm_no':
+        bot.edit_message_text("Cancelled. Use /spent to enter manually.", chat_id, call.message.message_id)
+        clear_state(chat_id)
+
+    elif action == 'edit_cat':
+        bot.edit_message_text("Select the correct category:", chat_id, call.message.message_id,
+                              reply_markup=build_category_keyboard("rec_edit"))
+
+    elif action == 'edit_type':
+        bot.edit_message_text("Is this Business or Personal?", chat_id, call.message.message_id,
+                              reply_markup=build_biz_personal_keyboard("exp"))
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('rec_edit_cat_'))
+def process_receipt_edit_category(call):
+    """Handle category edits from the receipt confirmation flow."""
+    chat_id = call.message.chat.id
+    state = get_state(chat_id)
+    category = call.data[len('rec_edit_cat_'):]
+    state['category'] = category
+    bot.edit_message_text(f"Category updated to: {category}. Is this Business or Personal?",
+                          chat_id, call.message.message_id,
+                          reply_markup=build_biz_personal_keyboard("exp"))
 
 # --- FEATURE 7: SMART PANTRY COMMANDS ---
 
@@ -365,7 +390,9 @@ def send_welcome(message):
         "WEFT OS COMMANDS\n\n"
         "FINANCIALS\n"
         "/log Depop $45 jeans - Log income\n"
-        "/spent $12 chipotle - Log expense\n"
+        "/spent - Log expense (guided flow → Notion)\n"
+        "/backfill - Batch-log old bank statement expenses\n"
+        "[photo] - Send a receipt photo to auto-log it\n"
         "/sub Netflix $15 June24 - Log subscription\n"
         "/weekcheck - Weekly breakdown\n\n"
         "PRODUCTIVITY\n"
@@ -373,6 +400,7 @@ def send_welcome(message):
         "/focus [task] - Start focus mode\n"
         "/plan - Sunday planning session\n"
         "/tasks - List your tasks\n"
+        "/top3 - Your 3 most urgent pending tasks\n"
         "/addtask [task] - Add a task\n"
         "/done 1 3 4 - Mark tasks done\n"
         "/brain [thoughts] - Dump and organize\n"
@@ -473,33 +501,152 @@ def morning_briefing(message):
 
     safe_send(message.chat.id, briefing)
 
+# --- NOTION EXPENSE FLOW: /spent, /backfill, photo receipt ---
+
 @bot.message_handler(commands=['spent'])
 def log_expense(message):
+    """Start the multi-step manual expense entry flow, writing to Notion."""
     set_last_chat_id(message.chat.id)
-    text = message.text.replace('/spent', '').strip()
+    chat_id = message.chat.id
+    clear_state(chat_id)
+    state = get_state(chat_id)
+    state['flow'] = 'spent'
+    state['source'] = 'Manual Entry'
+    state['date'] = datetime.datetime.now(est).strftime("%Y-%m-%d")
+    msg = bot.send_message(chat_id, "How much did you spend? (e.g. 12.50)")
+    bot.register_next_step_handler(msg, process_amount)
 
-    if text.lower().startswith('cash left') or text.lower().startswith('account balance'):
-        match = re.search(r'\$?(\d+(?:\.\d+)?)', text)
-        if match:
-            amount = match.group(1)
-            date = datetime.datetime.now(est).strftime("%Y-%m-%d")
-            label = "Cash balance" if 'cash' in text.lower() else "Account balance"
-            sheets_append("Spent", [[date, "Balance", label, amount, "Daily balance update"]])
-            safe_send(message.chat.id, f"Balance noted - ${amount} on {date}")
-        return
 
-    match = re.search(r'\$(\d+(?:\.\d+)?)\s+(.+)', text)
-    if match:
-        amount = match.group(1)
-        item = match.group(2)
-        date = datetime.datetime.now(est).strftime("%Y-%m-%d")
-        res = sheets_append("Spent", [[date, "Expense", item, amount, "Logged via bot"]])
-        if 'data' in res or 'error' not in res:
-            safe_send(message.chat.id, f"Logged - ${amount} at {item} on {date}")
+def process_amount(message):
+    """Step 1 of expense flow: capture amount."""
+    chat_id = message.chat.id
+    state = get_state(chat_id)
+    amount_str = message.text.replace('$', '').strip()
+    try:
+        state['amount'] = float(amount_str)
+        msg = bot.send_message(chat_id, "Where? (Vendor name)")
+        bot.register_next_step_handler(msg, process_vendor)
+    except ValueError:
+        msg = bot.send_message(chat_id, "Please enter a valid number (e.g. 12.50). How much?")
+        bot.register_next_step_handler(msg, process_amount)
+
+
+def process_vendor(message):
+    """Step 2 of expense flow: capture vendor."""
+    chat_id = message.chat.id
+    state = get_state(chat_id)
+    state['vendor'] = message.text.strip()
+    bot.send_message(chat_id, "Select a category:", reply_markup=build_category_keyboard("exp"))
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('exp_cat_'))
+def process_category(call):
+    """Step 3 of expense flow: category selected via inline button."""
+    chat_id = call.message.chat.id
+    state = get_state(chat_id)
+    state['category'] = call.data[len('exp_cat_'):]
+    bot.edit_message_text(f"Category: {state['category']}", chat_id, call.message.message_id)
+    bot.send_message(chat_id, "Business or Personal?", reply_markup=build_biz_personal_keyboard("exp"))
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('exp_type_'))
+def process_type(call):
+    """Step 4 of expense flow: business/personal selected via inline button."""
+    chat_id = call.message.chat.id
+    state = get_state(chat_id)
+    state['biz_or_personal'] = call.data[len('exp_type_'):]
+    bot.edit_message_text(f"Type: {state['biz_or_personal']}", chat_id, call.message.message_id)
+    msg = bot.send_message(chat_id, "Short note? (or type 'skip')")
+    bot.register_next_step_handler(msg, process_note)
+
+
+def process_note(message):
+    """Step 5 of expense flow: capture note and write to Notion."""
+    chat_id = message.chat.id
+    state = get_state(chat_id)
+    note = message.text.strip()
+    state['note'] = '' if note.lower() == 'skip' else note
+    finalize_expense(chat_id)
+
+
+def finalize_expense(chat_id):
+    """Write the completed expense to Notion and confirm to user."""
+    state = get_state(chat_id)
+    bot.send_message(chat_id, "Writing to Notion...")
+    res = write_expense_to_notion(
+        state.get('date'),
+        state.get('vendor'),
+        state.get('amount'),
+        state.get('category'),
+        state.get('biz_or_personal'),
+        state.get('note', ''),
+        state.get('source'),
+        state.get('image_url')
+    )
+    if res:
+        notion_url = res.get('url', '')
+        confirm = (
+            f"\u2705 Logged ${state.get('amount')} at {state.get('vendor')}\n"
+            f"Category: {state.get('category')} | {state.get('biz_or_personal')}\n"
+            f"Source: {state.get('source')}"
+        )
+        if notion_url:
+            confirm += f"\nView: {notion_url}"
+        if state.get('flow') == 'backfill':
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("\u2795 Add Another", callback_data="backfill_another"))
+            bot.send_message(chat_id, confirm, reply_markup=markup)
         else:
-            safe_send(message.chat.id, f"Error logging expense: {res.get('error', 'unknown')}")
+            bot.send_message(chat_id, confirm)
     else:
-        safe_send(message.chat.id, "Try: /spent $12 chipotle\nOr: /spent Cash left $47")
+        bot.send_message(chat_id, "\u274c Error writing to Notion. Check Railway logs.")
+    clear_state(chat_id)
+
+
+# --- /backfill COMMAND ---
+
+@bot.message_handler(commands=['backfill'])
+def backfill_expense(message):
+    """Start the bank statement backfill flow."""
+    set_last_chat_id(message.chat.id)
+    chat_id = message.chat.id
+    clear_state(chat_id)
+    state = get_state(chat_id)
+    state['flow'] = 'backfill'
+    state['source'] = 'Bank Statement Backfill'
+    msg = bot.send_message(chat_id, "\U0001f3e6 Backfill mode.\nDate of the transaction? (YYYY-MM-DD or 'today')")
+    bot.register_next_step_handler(msg, process_backfill_date)
+
+
+def process_backfill_date(message):
+    """Capture the date for a backfill entry."""
+    chat_id = message.chat.id
+    state = get_state(chat_id)
+    date_str = message.text.strip()
+    if date_str.lower() == 'today':
+        date_str = datetime.datetime.now(est).strftime("%Y-%m-%d")
+    if not re.match(r'\d{4}-\d{2}-\d{2}', date_str):
+        msg = bot.send_message(chat_id, "Use YYYY-MM-DD format (e.g. 2025-06-15):")
+        bot.register_next_step_handler(msg, process_backfill_date)
+        return
+    state['date'] = date_str
+    msg = bot.send_message(chat_id, "Amount? (e.g. 12.50)")
+    bot.register_next_step_handler(msg, process_amount)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'backfill_another')
+def backfill_another(call):
+    """Start a new backfill entry, reusing the same date."""
+    chat_id = call.message.chat.id
+    last_date = get_state(chat_id).get('date', datetime.datetime.now(est).strftime("%Y-%m-%d"))
+    clear_state(chat_id)
+    state = get_state(chat_id)
+    state['flow'] = 'backfill'
+    state['source'] = 'Bank Statement Backfill'
+    state['date'] = last_date
+    bot.edit_message_text("Starting next entry...", chat_id, call.message.message_id)
+    msg = bot.send_message(chat_id, f"Date kept as {last_date}.\nAmount? (e.g. 12.50)")
+    bot.register_next_step_handler(msg, process_amount)
 
 @bot.message_handler(commands=['log'])
 def log_income(message):
@@ -702,6 +849,32 @@ def list_tasks(message):
         response += "No tasks. Add one with /addtask"
 
     safe_send(message.chat.id, response)
+
+@bot.message_handler(commands=['top3'])
+def top3_tasks(message):
+    """Return the 3 most urgent pending tasks as a focused list."""
+    set_last_chat_id(message.chat.id)
+    res = sheets_get("Tasks")
+    rows = res.get("data", {}).get("values", []) if "data" in res else []
+    if not rows or len(rows) <= 1:
+        safe_send(message.chat.id, "No tasks yet. Add one with /addtask")
+        return
+
+    pending = []
+    for i, row in enumerate(rows[1:], 1):
+        task = row[1] if len(row) > 1 else ""
+        status = row[2] if len(row) > 2 else ""
+        if task and status != "Done":
+            pending.append((i, task))
+
+    if not pending:
+        safe_send(message.chat.id, "All tasks done. Add new ones with /addtask")
+        return
+
+    top = pending[:3]
+    lines = "\n".join([f"{j+1}. {t[1]}" for j, t in enumerate(top)])
+    safe_send(message.chat.id, f"TOP 3\n\n{lines}\n\nLock in. Get these done.")
+
 
 @bot.message_handler(commands=['done'])
 def mark_done(message):
@@ -1260,7 +1433,18 @@ def reminder_7pm():
     daily_reminder("Last call to eat tonight. Don't skip dinner.")
 
 def reminder_945pm():
-    daily_reminder("Night ginger shot. Take it, do your face routine, brush your teeth. That is your signal — wind down begins now. Phone goes down after this.")
+    chat_id = get_last_chat_id()
+    if not chat_id:
+        return
+    # Check Notion — if expenses were already logged today, skip the nag
+    try:
+        logged_today = has_expense_today()
+    except Exception:
+        logged_today = False  # fail open
+    if logged_today:
+        safe_send(chat_id, "Night ginger shot. Expenses already logged today — good work. Do your face routine, brush your teeth. Wind down begins now.")
+    else:
+        safe_send(chat_id, "Night ginger shot. Take it, do your face routine, brush your teeth. That is your signal — wind down begins now. Phone goes down after this.\n\nAlso: did you log your expenses today? Use /spent or send a receipt photo.")
 
 def reminder_10pm():
     daily_reminder("Phone down. No screen. Read something. Tomorrow starts tonight.")
