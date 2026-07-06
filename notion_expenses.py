@@ -190,3 +190,112 @@ def has_expense_today():
     except Exception as e:
         print(f"Notion today-check error: {e}")
         return False  # fail open — send the reminder if unsure
+
+# --- NOTION TASKS ---
+
+NOTION_TASKS_DB_ID = "39575f5d-f642-81f4-bcc9-e40542ce4721"
+
+def write_task_to_notion(task_name, priority=None):
+    """Write a new task to the WEFT Tasks Notion database."""
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28",
+    }
+    date_str = datetime.datetime.now(pytz.timezone('US/Eastern')).strftime("%Y-%m-%d")
+    
+    properties = {
+        "Task": {"title": [{"text": {"content": task_name}}]},
+        "Status": {"select": {"name": "To Do"}},
+        "Date Added": {"date": {"start": date_str}}
+    }
+    
+    if priority and priority in ["High", "Medium", "Low"]:
+        properties["Priority"] = {"select": {"name": priority}}
+        
+    payload = {
+        "parent": {"database_id": NOTION_TASKS_DB_ID},
+        "properties": properties
+    }
+    
+    try:
+        response = requests.post("https://api.notion.com/v1/pages", headers=headers, json=payload, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        print(f"Error writing task to Notion: {e}")
+        return None
+
+def get_open_tasks_from_notion():
+    """Retrieve all open tasks (Status = To Do) from Notion, returning list of dicts."""
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28",
+    }
+    
+    payload = {
+        "filter": {
+            "property": "Status",
+            "select": {"equals": "To Do"}
+        },
+        # Sort by Date Added ascending so oldest are first
+        "sorts": [{"property": "Date Added", "direction": "ascending"}]
+    }
+    
+    tasks = []
+    try:
+        response = requests.post(f"https://api.notion.com/v1/databases/{NOTION_TASKS_DB_ID}/query", headers=headers, json=payload, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        
+        for item in data.get("results", []):
+            props = item.get("properties", {})
+            
+            # Extract Task Name
+            title_prop = props.get("Task", {}).get("title", [])
+            name = title_prop[0].get("plain_text", "Untitled") if title_prop else "Untitled"
+            
+            # Extract Priority
+            priority_prop = props.get("Priority", {}).get("select")
+            priority = priority_prop.get("name") if priority_prop else None
+            
+            # Map priority to a sort weight (High=3, Medium=2, Low=1, None=0)
+            p_weight = {"High": 3, "Medium": 2, "Low": 1}.get(priority, 0)
+            
+            tasks.append({
+                "id": item["id"],
+                "name": name,
+                "priority": priority,
+                "priority_weight": p_weight
+            })
+            
+        return tasks
+    except Exception as e:
+        print(f"Error retrieving tasks from Notion: {e}")
+        return []
+
+def mark_tasks_done_in_notion(page_ids):
+    """Mark a list of Notion page IDs as Done."""
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28",
+    }
+    date_str = datetime.datetime.now(pytz.timezone('US/Eastern')).strftime("%Y-%m-%d")
+    
+    properties = {
+        "Status": {"select": {"name": "Done"}},
+        "Date Completed": {"date": {"start": date_str}}
+    }
+    
+    success_count = 0
+    for page_id in page_ids:
+        try:
+            payload = {"properties": properties}
+            requests.patch(f"https://api.notion.com/v1/pages/{page_id}", headers=headers, json=payload, timeout=10)
+            success_count += 1
+        except Exception as e:
+            print(f"Error marking task {page_id} done: {e}")
+            
+    return success_count
