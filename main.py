@@ -17,7 +17,8 @@ from notion_expenses import (
     write_expense_to_notion, extract_receipt_data_with_claude,
     build_category_keyboard, build_biz_personal_keyboard, build_confirmation_keyboard,
     get_state, clear_state, upload_file_to_notion_or_imgur, has_expense_today,
-    write_task_to_notion, get_open_tasks_from_notion, mark_tasks_done_in_notion
+    write_task_to_notion, get_open_tasks_from_notion, mark_tasks_done_in_notion,
+    write_food_to_notion, get_pantry_from_notion, update_pantry_item_in_notion, attach_photo_to_notion_page
 )
 
 # --- CONFIGURATION ---
@@ -28,19 +29,16 @@ SPREADSHEET_ID = "1A9xUO-6pyn7z8_yadwkyXtyVXcuGbkvPR_IZp9wQ7lg"
 REPORT_EMAIL = "byweftstudios@gmail.com"
 
 # --- CONNECTIONS ---
-# Google Sheets — all Sheets reads/writes
 SHEETS_CONNECTION_ID = "ca_IiHAEZge9MFQ"
-MAIN_CONNECTION_ID   = SHEETS_CONNECTION_ID  # kept for compatibility
-# Google Drive — backup copies to WEFT Studios folder
+MAIN_CONNECTION_ID   = SHEETS_CONNECTION_ID
 DRIVE_CONNECTION_ID  = "ca_DtO3TQJSSycg"
 
-# Gmail connections (verified email addresses via Composio API)
-WEFT_GMAIL_ID       = "ca_jGjDU1VkI0nt"   # byweftstudios@gmail.com
-KARIM_CONNECTION_ID = "ca_MPxmaIWiL6Kh"   # karimidrisofficial@gmail.com
-OLD_CONNECTION_ID   = "ca_-8JPIJXZII1P"   # 2008karimidris@gmail.com
-DAD_CONNECTION_ID   = "ca_R0AvyogLME_t"   # omarsudan007@gmail.com
+WEFT_GMAIL_ID       = "ca_jGjDU1VkI0nt"
+KARIM_CONNECTION_ID = "ca_MPxmaIWiL6Kh"
+OLD_CONNECTION_ID   = "ca_-8JPIJXZII1P"
+DAD_CONNECTION_ID   = "ca_R0AvyogLME_t"
 
-_WEFT_STUDIOS_FOLDER_ID = None  # cached at first use
+_WEFT_STUDIOS_FOLDER_ID = None
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode=None)
 est = pytz.timezone('US/Eastern')
@@ -58,7 +56,6 @@ def set_last_chat_id(chat_id):
     with open(LAST_CHAT_ID_FILE, "w") as f:
         f.write(str(chat_id))
 
-# --- HELPERS ---
 def execute_proxy(endpoint, method="GET", body=None, connection_id=None):
     url = "https://backend.composio.dev/api/v3.1/tools/execute/proxy"
     headers = {
@@ -80,10 +77,7 @@ def execute_proxy(endpoint, method="GET", body=None, connection_id=None):
     except Exception as e:
         return {"error": str(e)}
 
-# --- DRIVE BACKUP ---
-
 def _get_weft_studios_folder_id():
-    """Find and cache the WEFT Studios folder ID in Drive."""
     global _WEFT_STUDIOS_FOLDER_ID
     if _WEFT_STUDIOS_FOLDER_ID:
         return _WEFT_STUDIOS_FOLDER_ID
@@ -102,7 +96,6 @@ def _get_weft_studios_folder_id():
     return _WEFT_STUDIOS_FOLDER_ID
 
 def drive_backup(tab_name, values):
-    """Create a JSON log entry in the WEFT Studios Drive folder."""
     try:
         folder_id = _get_weft_studios_folder_id()
         now_str = datetime.datetime.now(est).strftime("%Y-%m-%d %H:%M:%S ET")
@@ -121,14 +114,9 @@ def drive_backup(tab_name, values):
     except Exception as e:
         print(f"Drive backup error: {e}")
 
-# --- SHEETS WEBHOOK (Apps Script) — primary Sheets transport ---
-# Set GOOGLE_SHEETS_WEBHOOK secret to the deployed Apps Script /exec URL.
-# Falls back to Composio proxy if the secret is not set.
-
 SHEETS_WEBHOOK_URL = os.environ.get("GOOGLE_SHEETS_WEBHOOK", "")
 
 def _webhook_post(action, tab, **kwargs):
-    """POST to the Apps Script webhook. Returns parsed JSON dict."""
     payload = {"action": action, "tab": tab}
     payload.update(kwargs)
     try:
@@ -149,7 +137,6 @@ def sheets_append(sheet_name, values):
 def sheets_get(sheet_name, range_notation="A:E"):
     if SHEETS_WEBHOOK_URL:
         result = _webhook_post("read", sheet_name)
-        # Normalise to match the Composio proxy shape: {"data": {"values": [...]}}
         if "values" in result:
             return {"data": {"values": result["values"]}}
         return result
@@ -169,213 +156,163 @@ def safe_send(chat_id, text):
 
 def get_unchecked_tasks():
     tasks = get_open_tasks_from_notion()
-    # return list of (index, task_name) to match previous signature
     return [(i+1, t["name"]) for i, t in enumerate(tasks)]
-
-# --- FEATURE 1: PANTRY HELPERS ---
-
-def get_pantry():
-    res = sheets_get("Pantry", "A:C")
-    items = {}
-    row_map = {}
-    if "data" in res and "values" in res["data"]:
-        rows = res["data"]["values"]
-        for i, row in enumerate(rows, 0):
-            if len(row) >= 2 and row[0]:
-                name = row[0].strip().lower()
-                try:
-                    qty = int(row[1])
-                except:
-                    qty = 0
-                items[name] = qty
-                row_map[name] = i + 1  # 1-indexed sheet row
-    return items, row_map
-
-def update_pantry_item(item_name, quantity, row_num=None):
-    item_lower = item_name.strip().lower()
-    items, row_map = get_pantry()
-    date = datetime.datetime.now(est).strftime("%Y-%m-%d")
-    if item_lower in row_map:
-        rn = row_map[item_lower]
-        updates = [
-            {"range": f"Pantry!B{rn}", "values": [[str(quantity)]]},
-            {"range": f"Pantry!C{rn}", "values": [[date]]}
-        ]
-        sheets_batch_update(updates)
-    else:
-        sheets_append("Pantry", [[item_name.strip(), str(quantity), date]])
-
-def deduct_pantry_item(chat_id, item_name):
-    item_lower = item_name.strip().lower()
-    items, row_map = get_pantry()
-    if item_lower not in items:
-        return
-    current = items[item_lower]
-    new_qty = max(0, current - 1)
-    date = datetime.datetime.now(est).strftime("%Y-%m-%d")
-    rn = row_map[item_lower]
-    updates = [
-        {"range": f"Pantry!B{rn}", "values": [[str(new_qty)]]},
-        {"range": f"Pantry!C{rn}", "values": [[date]]}
-    ]
-    sheets_batch_update(updates)
-    if new_qty == 1:
-        safe_send(chat_id, f"Low stock: {item_name} — 1 left. Pick some up soon.")
-    elif new_qty == 0:
-        safe_send(chat_id, f"{item_name} is out. Added to your grocery list.")
-
-# --- FEATURE 1: RECEIPT PHOTO SCANNING ---
 
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message, caption=None):
-    """Handle a photo message — triggers Notion expense receipt flow."""
     set_last_chat_id(message.chat.id)
     chat_id = message.chat.id
 
-    # Accept a caption passed programmatically (e.g. from /spent reply)
-    note = caption if caption else (message.caption.strip() if message.caption else "")
+    state = get_state(chat_id)
+    target_page_id = state.get('last_expense_id') or state.get('last_food_id')
 
-    status_msg = bot.send_message(chat_id, "\U0001f4f8 Scanning receipt with Claude Vision...")
+    if not target_page_id:
+        bot.send_message(chat_id, "Send a photo immediately after /spent, /groceries, or /ate to attach it.")
+        return
+
+    status_msg = bot.send_message(chat_id, "Uploading and attaching photo...")
 
     try:
         file_id = message.photo[-1].file_id
         file_info = bot.get_file(file_id)
         file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
         img_data = requests.get(file_url, timeout=15).content
-        img_b64 = base64.standard_b64encode(img_data).decode("utf-8")
 
-        # Upload image for Notion attachment
         image_url = upload_file_to_notion_or_imgur(img_data)
 
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        data = extract_receipt_data_with_claude(client, img_b64)
+        if image_url:
+            success = attach_photo_to_notion_page(target_page_id, image_url)
+            if success:
+                bot.edit_message_text("Photo attached to Notion.", chat_id, status_msg.message_id)
+            else:
+                bot.edit_message_text("Uploaded, but failed to attach to Notion.", chat_id, status_msg.message_id)
+        else:
+            bot.edit_message_text("Failed to upload photo.", chat_id, status_msg.message_id)
 
-        if not data:
-            bot.edit_message_text(
-                "\u274c Could not parse the receipt. Try a clearer photo or use /spent.",
-                chat_id, status_msg.message_id
-            )
-            return
-
-        # Store state for the multi-step confirmation flow
-        clear_state(chat_id)
-        state = get_state(chat_id)
-        state['flow'] = 'photo'
-        state['source'] = 'Receipt Photo'
-        state['vendor'] = data.get('vendor', 'Unknown Vendor')
-        state['amount'] = data.get('amount', 0)
-        state['date'] = data.get('date', datetime.datetime.now(est).strftime("%Y-%m-%d"))
-        state['category'] = data.get('category', 'Other')
-        state['note'] = note
-        state['image_url'] = image_url
-
-        summary = (
-            f"Extracted from receipt:\n"
-            f"Vendor: {state['vendor']}\n"
-            f"Amount: ${state['amount']}\n"
-            f"Date: {state['date']}\n"
-            f"Category: {state['category']}\n\n"
-            f"Does this look right?"
-        )
-
-        markup = build_confirmation_keyboard("rec")
-        bot.edit_message_text(summary, chat_id, status_msg.message_id, reply_markup=markup)
+        if 'last_expense_id' in state: del state['last_expense_id']
+        if 'last_food_id' in state: del state['last_food_id']
 
     except Exception as e:
-        print(f"Receipt scan error: {e}")
-        bot.edit_message_text(f"\u274c Error scanning receipt: {e}", chat_id, status_msg.message_id)
+        print(f"Photo attach error: {e}")
+        bot.edit_message_text(f"Error attaching photo: {e}", chat_id, status_msg.message_id)
 
+def parse_food_item(item_str):
+    parts = item_str.strip().split(' ', 1)
+    if not parts:
+        return None, None, ""
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('rec_'))
-def process_receipt_callback(call):
-    """Handle inline button callbacks from the receipt confirmation flow."""
-    chat_id = call.message.chat.id
-    state = get_state(chat_id)
-    action = call.data[len('rec_'):]
+    qty_str = parts[0]
+    rest = parts[1] if len(parts) > 1 else ""
 
-    if action == 'confirm_yes':
-        bot.edit_message_text("Confirmed. Is this Business or Personal?", chat_id, call.message.message_id,
-                              reply_markup=build_biz_personal_keyboard("exp"))
+    match = re.match(r'^([\d.]+)([a-zA-Z]*)$', qty_str)
+    if match:
+        qty = float(match.group(1))
+        unit = match.group(2)
 
-    elif action == 'confirm_no':
-        bot.edit_message_text("Cancelled. Use /spent to enter manually.", chat_id, call.message.message_id)
-        clear_state(chat_id)
+        if not unit and rest:
+            next_word = rest.split(' ', 1)[0].lower()
+            if next_word in ['gallon', 'oz', 'lb', 'lbs', 'cup', 'cups', 'ct', 'pack', 'bag', 'box']:
+                unit = next_word
+                rest = rest.split(' ', 1)[1] if ' ' in rest else ""
 
-    elif action == 'edit_cat':
-        bot.edit_message_text("Select the correct category:", chat_id, call.message.message_id,
-                              reply_markup=build_category_keyboard("rec_edit"))
+        return qty, unit, rest.strip()
 
-    elif action == 'edit_type':
-        bot.edit_message_text("Is this Business or Personal?", chat_id, call.message.message_id,
-                              reply_markup=build_biz_personal_keyboard("exp"))
+    return None, None, item_str.strip()
 
+def get_meal_type():
+    hour = datetime.datetime.now(est).hour
+    if hour < 11: return "Breakfast"
+    if hour < 15: return "Lunch"
+    if hour < 20: return "Dinner"
+    return "Snack"
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('rec_edit_cat_'))
-def process_receipt_edit_category(call):
-    """Handle category edits from the receipt confirmation flow."""
-    chat_id = call.message.chat.id
-    state = get_state(chat_id)
-    category = call.data[len('rec_edit_cat_'):]
-    state['category'] = category
-    bot.edit_message_text(f"Category updated to: {category}. Is this Business or Personal?",
-                          chat_id, call.message.message_id,
-                          reply_markup=build_biz_personal_keyboard("exp"))
-
-# --- FEATURE 7: SMART PANTRY COMMANDS ---
-
-@bot.message_handler(commands=['pantry'])
-def pantry_handler(message):
+@bot.message_handler(commands=['groceries'])
+def add_groceries(message):
     set_last_chat_id(message.chat.id)
-    arg = message.text.replace('/pantry', '').strip().lower()
-    items, _ = get_pantry()
+    text = message.text.replace('/groceries', '').strip()
+    if not text:
+        safe_send(message.chat.id, "Try: /groceries 6 eggs, 1 gallon milk")
+        return
+
+    items = [i.strip() for i in text.split(',')]
+    added = []
+
+    for item_str in items:
+        if not item_str: continue
+        qty, unit, name = parse_food_item(item_str)
+        if not name: name = item_str
+
+        res = write_food_to_notion(name, "Pantry", qty=qty, unit=unit, status="In Stock")
+        if res:
+            get_state(message.chat.id)['last_food_id'] = res['id']
+            added.append(name)
+
+    safe_send(message.chat.id, f"Added {len(added)} items to Pantry.")
+
+@bot.message_handler(commands=['ate'])
+def log_ate(message):
+    set_last_chat_id(message.chat.id)
+    text = message.text.replace('/ate', '').strip()
+    if not text:
+        safe_send(message.chat.id, "Try: /ate 2 croissants, 2% milk")
+        return
+
+    items = [i.strip() for i in text.split(',')]
+    meal_type = get_meal_type()
+    pantry = get_pantry_from_notion()
+
+    logged = []
+    deducted = []
+
+    for item_str in items:
+        if not item_str: continue
+        qty, unit, name = parse_food_item(item_str)
+        if not name: name = item_str
+
+        res = write_food_to_notion(name, "Meal Log", qty=qty, unit=unit, meal_type=meal_type)
+        if res:
+            get_state(message.chat.id)['last_food_id'] = res['id']
+            logged.append(name)
+
+        if qty is not None:
+            name_lower = name.lower()
+            for p_item in pantry:
+                if name_lower in p_item['name'].lower() or p_item['name'].lower() in name_lower:
+                    if p_item['qty'] is not None:
+                        new_qty = max(0, p_item['qty'] - qty)
+                        new_status = "In Stock"
+                        if new_qty == 0:
+                            new_status = "Out"
+                        elif new_qty <= 2:
+                            new_status = "Low"
+
+                        if update_pantry_item_in_notion(p_item['id'], new_qty, new_status):
+                            deducted.append(f"{p_item['name']} ({new_qty} left)")
+                    break
+
+    reply = f"Logged {len(logged)} items for {meal_type}."
+    if deducted:
+        reply += "\n\nPantry updated:\n- " + "\n- ".join(deducted)
+
+    safe_send(message.chat.id, reply)
+
+@bot.message_handler(commands=['fridge'])
+def fridge_handler(message):
+    set_last_chat_id(message.chat.id)
+    items = get_pantry_from_notion()
 
     if not items:
-        safe_send(message.chat.id, "Pantry is empty. Add items with /addpantry [item] [qty]")
+        safe_send(message.chat.id, "Pantry is empty!")
         return
 
-    if arg == 'low':
-        low = {k: v for k, v in items.items() if v <= 1}
-        if not low:
-            safe_send(message.chat.id, "Nothing low. Pantry is stocked.")
-        else:
-            lines = [f"- {k}: {v} left" for k, v in sorted(low.items())]
-            safe_send(message.chat.id, "LOW STOCK\n\n" + "\n".join(lines))
-    else:
-        lines = [f"- {k}: {v}" for k, v in sorted(items.items())]
-        safe_send(message.chat.id, "PANTRY\n\n" + "\n".join(lines))
+    lines = []
+    for item in items:
+        qty_str = f"{item['qty']} " if item['qty'] is not None else ""
+        unit_str = f"{item['unit']} " if item['unit'] else ""
+        status_str = " Low" if item['status'] == "Low" else ""
+        lines.append(f"- {qty_str}{unit_str}{item['name']}{status_str}")
 
-@bot.message_handler(commands=['addpantry'])
-def add_pantry(message):
-    set_last_chat_id(message.chat.id)
-    text = message.text.replace('/addpantry', '').strip()
-    parts = text.rsplit(' ', 1)
-    if len(parts) == 2:
-        item, qty_str = parts[0].strip(), parts[1].strip()
-        try:
-            qty = int(qty_str)
-        except:
-            item, qty = text, 1
-    else:
-        item, qty = text, 1
-
-    if not item:
-        safe_send(message.chat.id, "Try: /addpantry chicken breast 4")
-        return
-
-    update_pantry_item(item, qty)
-    safe_send(message.chat.id, f"Pantry updated: {item} — {qty}")
-
-@bot.message_handler(commands=['used'])
-def used_item(message):
-    set_last_chat_id(message.chat.id)
-    item = message.text.replace('/used', '').strip()
-    if not item:
-        safe_send(message.chat.id, "Try: /used chicken breast")
-        return
-    deduct_pantry_item(message.chat.id, item)
-    safe_send(message.chat.id, f"Deducted 1 from {item}.")
-
-# --- EXISTING COMMANDS ---
+    safe_send(message.chat.id, "YOUR PANTRY:\n" + "\n".join(lines))
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
@@ -384,7 +321,7 @@ def send_welcome(message):
         "WEFT OS COMMANDS\n\n"
         "FINANCIALS\n"
         "/log Depop $45 jeans - Log income\n"
-        "/spent - Log expense (guided flow → Notion)\n"
+        "/spent - Log expense (shorthand or guided flow -> Notion)\n"
         "/backfill - Batch-log old bank statement expenses\n"
         "[photo] - Send a receipt photo to auto-log it\n"
         "/sub Netflix $15 June24 - Log subscription\n"
@@ -403,15 +340,11 @@ def send_welcome(message):
         "/hype - Get motivated\n"
         "/habit - Daily checklist\n"
         "/wins [win] - Log a win\n\n"
-        "HEALTH\n"
-        "/eat [meal] - Log food\n"
-        "/fridge [item] [amount] - Update pantry\n"
+        "FOOD & PANTRY\n"
+        "/groceries 6 eggs, 1 gallon milk - Add items to Pantry\n"
+        "/ate 2 eggs, coffee - Log a meal + deduct from Pantry\n"
+        "/fridge - See what's in stock\n"
         "/workout - Today's workout\n\n"
-        "PANTRY\n"
-        "/pantry - Show all pantry items\n"
-        "/pantry low - Show low/out items\n"
-        "/addpantry [item] [qty] - Add to pantry\n"
-        "/used [item] - Deduct 1 from pantry\n\n"
         "CONTENT\n"
         "/publer_all - Post to all platforms\n"
     )
@@ -496,13 +429,80 @@ def morning_briefing(message):
 
     safe_send(message.chat.id, briefing)
 
-# --- NOTION EXPENSE FLOW: /spent, /backfill, photo receipt ---
+CATEGORIES_LOWER = {
+    "fabric", "hardware", "tools/equipment", "software",
+    "travel", "marketing", "packaging/shipping", "food", "personal", "other"
+}
+CATEGORY_DISPLAY = {
+    "fabric": "Fabric", "hardware": "Hardware", "tools/equipment": "Tools/Equipment",
+    "software": "Software", "travel": "Travel", "marketing": "Marketing",
+    "packaging/shipping": "Packaging/Shipping", "food": "Food",
+    "personal": "Personal", "other": "Other"
+}
+
+def parse_expense_shorthand(text):
+    text = text.strip()
+    if not text:
+        return None
+    parts = text.split()
+    if len(parts) < 2:
+        return None
+    try:
+        amount = float(parts[0].replace('$', ''))
+    except ValueError:
+        return None
+    if len(parts) < 2:
+        return None
+    vendor = parts[1]
+    remaining = parts[2:]
+    category = "Other"
+    cat_index = None
+    for i, token in enumerate(remaining):
+        if token.lower() in CATEGORIES_LOWER:
+            category = CATEGORY_DISPLAY[token.lower()]
+            cat_index = i
+            break
+    if cat_index is not None:
+        note_parts = remaining[cat_index + 1:]
+    else:
+        note_parts = remaining
+    note = ' '.join(note_parts)
+    full_lower = text.lower()
+    biz_or_personal = "Business" if "business" in full_lower else "Personal"
+    return {
+        'amount': amount,
+        'vendor': vendor,
+        'category': category,
+        'note': note,
+        'biz_or_personal': biz_or_personal
+    }
 
 @bot.message_handler(commands=['spent'])
 def log_expense(message):
-    """Start the multi-step manual expense entry flow, writing to Notion."""
     set_last_chat_id(message.chat.id)
     chat_id = message.chat.id
+    args = message.text.replace('/spent', '').strip()
+
+    if args:
+        parsed = parse_expense_shorthand(args)
+        if not parsed:
+            safe_send(chat_id, "Couldn't parse that. Try:\n/spent 13.84 Walmart Food groceries\n\nOr just /spent for the guided flow.")
+            return
+        clear_state(chat_id)
+        state = get_state(chat_id)
+        state.update({
+            'flow': 'spent',
+            'source': 'Manual Entry',
+            'date': datetime.datetime.now(est).strftime("%Y-%m-%d"),
+            'amount': parsed['amount'],
+            'vendor': parsed['vendor'],
+            'category': parsed['category'],
+            'biz_or_personal': parsed['biz_or_personal'],
+            'note': parsed['note']
+        })
+        finalize_expense(chat_id)
+        return
+
     clear_state(chat_id)
     state = get_state(chat_id)
     state['flow'] = 'spent'
@@ -511,9 +511,7 @@ def log_expense(message):
     msg = bot.send_message(chat_id, "How much did you spend? (e.g. 12.50)")
     bot.register_next_step_handler(msg, process_amount)
 
-
 def process_amount(message):
-    """Step 1 of expense flow: capture amount."""
     chat_id = message.chat.id
     state = get_state(chat_id)
     amount_str = message.text.replace('$', '').strip()
@@ -525,28 +523,22 @@ def process_amount(message):
         msg = bot.send_message(chat_id, "Please enter a valid number (e.g. 12.50). How much?")
         bot.register_next_step_handler(msg, process_amount)
 
-
 def process_vendor(message):
-    """Step 2 of expense flow: capture vendor."""
     chat_id = message.chat.id
     state = get_state(chat_id)
     state['vendor'] = message.text.strip()
     bot.send_message(chat_id, "Select a category:", reply_markup=build_category_keyboard("exp"))
 
-
 @bot.callback_query_handler(func=lambda call: call.data.startswith('exp_cat_'))
 def process_category(call):
-    """Step 3 of expense flow: category selected via inline button."""
     chat_id = call.message.chat.id
     state = get_state(chat_id)
     state['category'] = call.data[len('exp_cat_'):]
     bot.edit_message_text(f"Category: {state['category']}", chat_id, call.message.message_id)
     bot.send_message(chat_id, "Business or Personal?", reply_markup=build_biz_personal_keyboard("exp"))
 
-
 @bot.callback_query_handler(func=lambda call: call.data.startswith('exp_type_'))
 def process_type(call):
-    """Step 4 of expense flow: business/personal selected via inline button."""
     chat_id = call.message.chat.id
     state = get_state(chat_id)
     state['biz_or_personal'] = call.data[len('exp_type_'):]
@@ -554,18 +546,14 @@ def process_type(call):
     msg = bot.send_message(chat_id, "Short note? (or type 'skip')")
     bot.register_next_step_handler(msg, process_note)
 
-
 def process_note(message):
-    """Step 5 of expense flow: capture note and write to Notion."""
     chat_id = message.chat.id
     state = get_state(chat_id)
     note = message.text.strip()
     state['note'] = '' if note.lower() == 'skip' else note
     finalize_expense(chat_id)
 
-
 def finalize_expense(chat_id):
-    """Write the completed expense to Notion and confirm to user."""
     state = get_state(chat_id)
     bot.send_message(chat_id, "Writing to Notion...")
     res = write_expense_to_notion(
@@ -579,9 +567,10 @@ def finalize_expense(chat_id):
         state.get('image_url')
     )
     if res:
+        state['last_expense_id'] = res['id']
         notion_url = res.get('url', '')
         confirm = (
-            f"\u2705 Logged ${state.get('amount')} at {state.get('vendor')}\n"
+            f"Logged ${state.get('amount')} at {state.get('vendor')}\n"
             f"Category: {state.get('category')} | {state.get('biz_or_personal')}\n"
             f"Source: {state.get('source')}"
         )
@@ -589,32 +578,61 @@ def finalize_expense(chat_id):
             confirm += f"\nView: {notion_url}"
         if state.get('flow') == 'backfill':
             markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("\u2795 Add Another", callback_data="backfill_another"))
+            markup.add(InlineKeyboardButton("Add Another", callback_data="backfill_another"))
             bot.send_message(chat_id, confirm, reply_markup=markup)
         else:
             bot.send_message(chat_id, confirm)
     else:
-        bot.send_message(chat_id, "\u274c Error writing to Notion. Check Railway logs.")
+        bot.send_message(chat_id, "Error writing to Notion. Check Railway logs.")
     clear_state(chat_id)
-
-
-# --- /backfill COMMAND ---
 
 @bot.message_handler(commands=['backfill'])
 def backfill_expense(message):
-    """Start the bank statement backfill flow."""
     set_last_chat_id(message.chat.id)
     chat_id = message.chat.id
+    args = message.text.replace('/backfill', '').strip()
+
+    if args:
+        parts = args.split()
+        date_str = None
+        rest = args
+        if parts and re.match(r'\d{4}-\d{2}-\d{2}', parts[0]):
+            date_str = parts[0]
+            rest = ' '.join(parts[1:])
+        elif parts and parts[0].lower() == 'today':
+            date_str = datetime.datetime.now(est).strftime("%Y-%m-%d")
+            rest = ' '.join(parts[1:])
+        else:
+            pass
+
+        if date_str and rest:
+            parsed = parse_expense_shorthand(rest)
+            if not parsed:
+                safe_send(chat_id, "Couldn't parse that. Try:\n/backfill 2025-06-15 13.84 Walmart Food groceries\n\nOr just /backfill for the guided flow.")
+                return
+            clear_state(chat_id)
+            state = get_state(chat_id)
+            state.update({
+                'flow': 'backfill',
+                'source': 'Bank Statement Backfill',
+                'date': date_str,
+                'amount': parsed['amount'],
+                'vendor': parsed['vendor'],
+                'category': parsed['category'],
+                'biz_or_personal': parsed['biz_or_personal'],
+                'note': parsed['note']
+            })
+            finalize_expense(chat_id)
+            return
+
     clear_state(chat_id)
     state = get_state(chat_id)
     state['flow'] = 'backfill'
     state['source'] = 'Bank Statement Backfill'
-    msg = bot.send_message(chat_id, "\U0001f3e6 Backfill mode.\nDate of the transaction? (YYYY-MM-DD or 'today')")
+    msg = bot.send_message(chat_id, "Backfill mode.\nDate of the transaction? (YYYY-MM-DD or 'today')")
     bot.register_next_step_handler(msg, process_backfill_date)
 
-
 def process_backfill_date(message):
-    """Capture the date for a backfill entry."""
     chat_id = message.chat.id
     state = get_state(chat_id)
     date_str = message.text.strip()
@@ -628,10 +646,8 @@ def process_backfill_date(message):
     msg = bot.send_message(chat_id, "Amount? (e.g. 12.50)")
     bot.register_next_step_handler(msg, process_amount)
 
-
 @bot.callback_query_handler(func=lambda call: call.data == 'backfill_another')
 def backfill_another(call):
-    """Start a new backfill entry, reusing the same date."""
     chat_id = call.message.chat.id
     last_date = get_state(chat_id).get('date', datetime.datetime.now(est).strftime("%Y-%m-%d"))
     clear_state(chat_id)
@@ -745,53 +761,6 @@ def log_win(message):
     sheets_append("Wins", [[date, win_text, "Logged via bot"]])
     safe_send(message.chat.id, f"Win logged: {win_text}")
 
-@bot.message_handler(commands=['eat'])
-def log_food(message):
-    set_last_chat_id(message.chat.id)
-    meal = message.text.replace('/eat', '').strip()
-    if not meal:
-        safe_send(message.chat.id, "What did you eat? Try: /eat Chicken and rice")
-        return
-    date = datetime.datetime.now(est).strftime("%Y-%m-%d")
-    time_str = datetime.datetime.now(est).strftime("%H:%M")
-    sheets_append("Food Log", [[date, time_str, meal, "", "Logged via bot"]])
-    safe_send(message.chat.id, f"Meal logged: {meal} at {time_str}")
-    # Deduct from pantry for primary ingredient (first word match)
-    first_word = meal.split()[0].lower() if meal.split() else ""
-    if first_word:
-        deduct_pantry_item(message.chat.id, first_word)
-
-@bot.message_handler(commands=['fridge'])
-def fridge_handler(message):
-    set_last_chat_id(message.chat.id)
-    text = message.text.replace('/fridge', '').strip()
-
-    if text.lower() == 'check' or text == '':
-        res = sheets_get("Pantry", "A:C")
-        if "data" in res and "values" in res["data"]:
-            rows = res["data"]["values"]
-            if len(rows) > 1:
-                items = []
-                for row in rows[1:]:
-                    if len(row) >= 2:
-                        items.append(f"- {row[0]}: {row[1]}")
-                safe_send(message.chat.id, "Your pantry:\n" + "\n".join(items) if items else "Pantry is empty!")
-            else:
-                safe_send(message.chat.id, "Pantry is empty!")
-        else:
-            safe_send(message.chat.id, "Error checking pantry.")
-        return
-
-    date = datetime.datetime.now(est).strftime("%Y-%m-%d")
-    parts = text.rsplit(' ', 1)
-    if len(parts) == 2:
-        item, amount = parts[0], parts[1]
-    else:
-        item, amount = text, "1"
-
-    sheets_append("Pantry", [[item, amount, date]])
-    safe_send(message.chat.id, f"Pantry updated: {item} - {amount}")
-
 @bot.message_handler(commands=['addtask'])
 def add_task(message):
     set_last_chat_id(message.chat.id)
@@ -799,7 +768,7 @@ def add_task(message):
     if not text:
         safe_send(message.chat.id, "Try: /addtask Finish the mockup\n(Or send multiple lines to add multiple tasks)")
         return
-    
+
     lines = [line.strip() for line in text.split('\n') if line.strip()]
     if len(lines) == 1:
         write_task_to_notion(lines[0])
@@ -813,7 +782,7 @@ def add_task(message):
 def list_tasks(message):
     set_last_chat_id(message.chat.id)
     tasks = get_open_tasks_from_notion()
-    
+
     if not tasks:
         safe_send(message.chat.id, "No open tasks. Add one with /addtask")
         return
@@ -828,25 +797,22 @@ def list_tasks(message):
 
 @bot.message_handler(commands=['top3'])
 def top3_tasks(message):
-    """Return the 3 most urgent pending tasks as a focused list."""
     set_last_chat_id(message.chat.id)
     tasks = get_open_tasks_from_notion()
-    
+
     if not tasks:
         safe_send(message.chat.id, "All tasks done. Add new ones with /addtask")
         return
 
-    # Sort by priority weight descending, then keep original order (oldest first)
     sorted_tasks = sorted(tasks, key=lambda x: x["priority_weight"], reverse=True)
     top = sorted_tasks[:3]
-    
+
     lines = []
     for j, t in enumerate(top, 1):
         prefix = f"[{t['priority']}] " if t['priority'] else ""
         lines.append(f"{j}. {prefix}{t['name']}")
-        
-    safe_send(message.chat.id, f"TOP 3\n\n{chr(10).join(lines)}\n\nLock in. Get these done.")
 
+    safe_send(message.chat.id, f"TOP 3\n\n{chr(10).join(lines)}\n\nLock in. Get these done.")
 
 @bot.message_handler(commands=['done'])
 def mark_done(message):
@@ -873,9 +839,9 @@ def mark_done(message):
 
     if page_ids_to_mark:
         success_count = mark_tasks_done_in_notion(page_ids_to_mark)
-        
+
         remaining = [t for i, t in enumerate(tasks, 1) if i not in nums]
-        
+
         response = f"Checked off {success_count} tasks - lets go Keem.\n\n"
         if remaining:
             lines = [f"  {i+1}. {t['name']}" for i, t in enumerate(remaining)]
@@ -891,15 +857,14 @@ def mark_done(message):
 def transition_action(message):
     set_last_chat_id(message.chat.id)
     tasks = get_open_tasks_from_notion()
-    
+
     if not tasks:
         safe_send(message.chat.id, "Next: take a breath. No open tasks right now.")
         return
 
-    # Sort by priority weight descending, then original order (oldest first)
     sorted_tasks = sorted(tasks, key=lambda x: x["priority_weight"], reverse=True)
     next_task = sorted_tasks[0]
-    
+
     safe_send(message.chat.id, f"Next: {next_task['name']}")
 
 @bot.message_handler(commands=['focus'])
@@ -994,18 +959,8 @@ def get_workout(message):
 @bot.message_handler(commands=['plan'])
 def planning_session(message):
     set_last_chat_id(message.chat.id)
-    unchecked = get_unchecked_tasks()
-    if unchecked:
-        user_state[message.chat.id] = {
-            'state': 'reviewing_tasks',
-            'tasks': unchecked,
-            'index': 0
-        }
-        task_list = "\n".join([f"- {t[1]}" for t in unchecked])
-        safe_send(message.chat.id, f"You did not check off these tasks:\n\n{task_list}\n\nWhy did you not complete '{unchecked[0][1]}'?")
-    else:
-        user_state[message.chat.id] = {'state': 'sunday_q1'}
-        safe_send(message.chat.id, "SUNDAY PLANNING SESSION\n\nQ1: What did you finish last week?")
+    user_state[message.chat.id] = {'state': 'plan_q1'}
+    safe_send(message.chat.id, "WEEKLY PLANNING\n\nWhat are your top 3 priorities this week? (comma separated)")
 
 @bot.message_handler(func=lambda m: isinstance(user_state.get(m.chat.id), dict))
 def handle_state(message):
@@ -1013,55 +968,40 @@ def handle_state(message):
     state = user_state.get(message.chat.id, {})
     current = state.get('state')
 
-    if current == 'reviewing_tasks':
-        tasks = state['tasks']
-        idx = state['index'] + 1
-        if idx < len(tasks):
-            state['index'] = idx
-            safe_send(message.chat.id, f"Why did you not complete '{tasks[idx][1]}'?")
-        else:
-            user_state[message.chat.id] = {'state': 'sunday_q1'}
-            safe_send(message.chat.id, "Q1: What did you finish last week?")
+    if current == 'plan_q1':
+        user_state[message.chat.id] = {'state': 'plan_q2', 'q1': message.text}
+        safe_send(message.chat.id, "Anything carrying over from last week that's unfinished? (comma separated, or 'none')")
 
-    elif current == 'sunday_q1':
-        user_state[message.chat.id] = {'state': 'sunday_q2', 'q1': message.text}
-        safe_send(message.chat.id, "Q2: What did not get done?")
-
-    elif current == 'sunday_q2':
-        user_state[message.chat.id] = {'state': 'sunday_q3', 'q1': state.get('q1'), 'q2': message.text}
-        safe_send(message.chat.id, "Q3: What is your number one priority this week?")
-
-    elif current == 'sunday_q3':
-        user_state[message.chat.id] = {'state': 'sunday_q4', 'q1': state.get('q1'), 'q2': state.get('q2'), 'q3': message.text}
-        safe_send(message.chat.id, "Q4: What content are you posting this week?")
-
-    elif current == 'sunday_q4':
-        user_state[message.chat.id] = {'state': 'sunday_q5', 'q1': state.get('q1'), 'q2': state.get('q2'), 'q3': state.get('q3'), 'q4': message.text}
-        safe_send(message.chat.id, "Q5: Any events, appointments, or deadlines this week?")
-
-    elif current == 'sunday_q5':
+    elif current == 'plan_q2':
         q1 = state.get('q1', '')
-        q2 = state.get('q2', '')
-        q3 = state.get('q3', '')
-        q4 = state.get('q4', '')
-        q5 = message.text
+        q2 = message.text
 
-        date = datetime.datetime.now(est).strftime("%Y-%m-%d")
-        sheets_append("Planning", [[date, q1, q2, q3, q4]])
+        priorities = [p.strip() for p in q1.split(',') if p.strip()]
+        for p in priorities:
+            write_task_to_notion(f"[This Week] {p}", priority="High")
 
-        summary = (
-            "WEEK LOCKED IN\n\n"
-            f"Finished last week: {q1}\n"
-            f"Did not finish: {q2}\n"
-            f"Priority 1: {q3}\n"
-            f"Content: {q4}\n"
-            f"Deadlines: {q5}\n\n"
-            "Go make it happen. This week counts."
-        )
+        carryovers = []
+        if q2.lower() not in ['none', 'no', 'skip']:
+            carryovers = [c.strip() for c in q2.split(',') if c.strip()]
+            for c in carryovers:
+                write_task_to_notion(f"[Carryover] {c}", priority="Medium")
+
+        summary = "WEEK LOCKED IN\n\n"
+        summary += "GYM SPLIT\n"
+        summary += "Mon: Push\nTue: Pull\nWed: Rest/Walk\nThu: Legs\nFri: Full Body\nSat/Sun: Rest/Walk\n\n"
+
+        summary += "TOP PRIORITIES\n"
+        for i, p in enumerate(priorities, 1):
+            summary += f"{i}. {p}\n"
+
+        if carryovers:
+            summary += "\nCARRYOVERS\n"
+            for i, c in enumerate(carryovers, 1):
+                summary += f"- {c}\n"
+
+        summary += "\nGo make it happen. This week counts."
         safe_send(message.chat.id, summary)
         del user_state[message.chat.id]
-
-# --- /emails COMMAND — MULTI-INBOX (4 accounts) ---
 
 EMAIL_SKIP_KEYWORDS = ['security alert', 'sign-in', 'verification', 'confirm your', 'welcome to',
                        'unsubscribe', 'reposted', 'notification', 'new follower', 'liked your']
@@ -1094,7 +1034,6 @@ def _parse_headers(msg_data):
     return subject, sender
 
 def fetch_top_emails(connection_id, max_results=8):
-    """Fetch top 3 important emails, filtered. Returns list of formatted strings."""
     if not connection_id:
         return ["Not connected."]
     query = ("is:unread category:primary "
@@ -1121,7 +1060,6 @@ def fetch_top_emails(connection_id, max_results=8):
     return emails if emails else ["Inbox clear."]
 
 def fetch_dad_emails(connection_id, max_results=20):
-    """Fetch only truly important emails for Dad, summarised in plain English."""
     if not connection_id:
         return ["Not connected."]
     query = "is:unread -from:noreply -from:no-reply -from:alerts -from:notifications"
@@ -1141,7 +1079,6 @@ def fetch_dad_emails(connection_id, max_results=20):
         send_lower = sender.lower()
         if not any(k in subj_lower or k in send_lower for k in DAD_IMPORTANT_KEYWORDS):
             continue
-        # Summarise with Claude in one plain sentence
         try:
             client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
             resp = client.messages.create(
@@ -1164,10 +1101,10 @@ def multi_inbox(message):
     set_last_chat_id(message.chat.id)
     safe_send(message.chat.id, "Checking all 4 inboxes...")
 
-    weft_emails   = fetch_top_emails(WEFT_GMAIL_ID)         # byweftstudios
-    karim_emails  = fetch_top_emails(KARIM_CONNECTION_ID)   # karimidrisofficial
-    old_emails    = fetch_top_emails(OLD_CONNECTION_ID)     # 2008karimidris
-    dad_emails    = fetch_dad_emails(DAD_CONNECTION_ID)     # omarsudan007
+    weft_emails   = fetch_top_emails(WEFT_GMAIL_ID)
+    karim_emails  = fetch_top_emails(KARIM_CONNECTION_ID)
+    old_emails    = fetch_top_emails(OLD_CONNECTION_ID)
+    dad_emails    = fetch_dad_emails(DAD_CONNECTION_ID)
 
     def fmt(lines):
         return "\n".join(lines) if lines else "Inbox clear."
@@ -1199,15 +1136,12 @@ def handle_text(message):
     else:
         safe_send(message.chat.id, "Type /help to see all commands.")
 
-# --- FEATURE 2: WEEKLY EMAIL REPORT ---
-
 def send_weekly_email():
     chat_id = get_last_chat_id()
     now = datetime.datetime.now(est)
     week_start = (now - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
     today_str = now.strftime("%Y-%m-%d")
 
-    # Income
     income_res = sheets_get("Sheet1")
     income_by_source = {}
     total_income = 0
@@ -1222,7 +1156,6 @@ def send_weekly_email():
                 except:
                     pass
 
-    # Expenses
     expense_res = sheets_get("Spent")
     expense_by_cat = {}
     total_spent = 0
@@ -1237,7 +1170,6 @@ def send_weekly_email():
                 except:
                     pass
 
-    # Tasks
     tasks_res = sheets_get("Tasks")
     completed_count = 0
     carried_tasks = []
@@ -1250,7 +1182,6 @@ def send_weekly_email():
             elif task:
                 carried_tasks.append(task)
 
-    # Wins / Food days logged this week
     wins_res = sheets_get("Wins")
     wins_count = 0
     if "data" in wins_res and "values" in wins_res["data"]:
@@ -1263,7 +1194,6 @@ def send_weekly_email():
             if len(row) > 0 and row[0] >= week_start:
                 food_days.add(row[0])
 
-    # Days until launch (placeholder — set your own target date)
     launch_date = datetime.datetime(2025, 9, 1, tzinfo=est)
     days_left = (launch_date - now).days
 
@@ -1281,16 +1211,15 @@ def send_weekly_email():
         f"Net: ${net:.2f}\n\n"
         f"TASKS\n"
         f"Completed: {completed_count}\n"
-        f"Carried over: {len(carried_tasks)} — {carried_lines}\n\n"
+        f"Carried over: {len(carried_tasks)} - {carried_lines}\n\n"
         f"HABITS\n"
         f"Wins logged: {wins_count} days\n"
         f"Food logged: {len(food_days)} days\n\n"
         f"Drop 001 launches in {days_left} days. Keep going Keem."
     )
 
-    subject = f"WEFT Weekly Report — {today_str}"
+    subject = f"WEFT Weekly Report - {today_str}"
 
-    # Send via Gmail through Composio
     gmail_url = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
     import email.mime.text
     import email.mime.multipart
@@ -1305,35 +1234,31 @@ def send_weekly_email():
         safe_send(chat_id, f"Weekly report sent to {REPORT_EMAIL}.")
     print(f"Weekly email sent for {today_str}")
 
-# --- FEATURE 3: SUNDAY RESET REMINDER ---
-
 def sunday_reset_reminder():
     chat_id = get_last_chat_id()
     if chat_id:
-        safe_send(chat_id, "Time for your Sunday reset. Run /plan now — build your week before you sleep. Tomorrow starts tonight.")
-
-# --- FEATURE 4: GINGER SHOT BATCH REMINDER ---
+        safe_send(chat_id, "Time for your Sunday reset. Run /plan now - build your week before you sleep. Tomorrow starts tonight.")
 
 def ginger_batch_reminder():
     chat_id = get_last_chat_id()
     if chat_id:
         safe_send(chat_id, "Make your ginger shot batch for the week. Blend fresh ginger, lemon, water. Store in the fridge. Costs nothing and hits different.")
 
-# --- FEATURE 1: SUNDAY GROCERY LIST ---
-
 def sunday_grocery_list():
+    """Send a grocery list of low/out-of-stock pantry items — reads from Notion."""
     chat_id = get_last_chat_id()
     if not chat_id:
         return
-    items, _ = get_pantry()
-    low = [f"- {k} ({v} left)" for k, v in sorted(items.items()) if v <= 1]
+    items = get_pantry_from_notion()
+    low = [
+        f"- {item['name']} ({item['qty']} left)" if item.get('qty') is not None else f"- {item['name']}"
+        for item in items if item.get('status') in ('Low', 'Out')
+    ]
     if low:
         msg = "Grocery list for this week:\n\n" + "\n".join(low) + "\n\nPick these up before Sunday ends."
     else:
-        msg = "Pantry looks good — nothing critically low this week."
+        msg = "Pantry looks good - nothing critically low this week."
     safe_send(chat_id, msg)
-
-# --- FEATURE 1: SUNDAY MEAL PREP REMINDER ---
 
 def sunday_meal_prep_check():
     chat_id = get_last_chat_id()
@@ -1349,8 +1274,6 @@ def sunday_meal_prep_check():
                 break
     if not logged_today:
         safe_send(chat_id, "Have you prepped your food for the week? Season your chicken, cook your rice, prep your burritos. Future you will thank you.")
-
-# --- FEATURE 6: SUBSCRIPTION RENEWAL ALERTS ---
 
 def check_subscriptions():
     chat_id = get_last_chat_id()
@@ -1369,7 +1292,6 @@ def check_subscriptions():
         renewal_str = row[4] if len(row) > 4 else ""
         if not renewal_str:
             continue
-        # Try to parse renewal date (format like "June24" or "2025-06-24" or "Jun 24")
         renewal_date = None
         for fmt in ("%Y-%m-%d", "%b%d", "%B%d", "%b %d", "%B %d"):
             try:
@@ -1383,9 +1305,7 @@ def check_subscriptions():
         if renewal_date:
             days_until = (renewal_date - today).days
             if 0 <= days_until <= 3:
-                safe_send(chat_id, f"Heads up — {name} ${amount} charges in {days_until} days. Cancel now if you want to stop it.")
-
-# --- FEATURE 5: DAILY REMINDERS ---
+                safe_send(chat_id, f"Heads up - {name} ${amount} charges in {days_until} days. Cancel now if you want to stop it.")
 
 def daily_reminder(msg_text, days_of_week=None):
     now = datetime.datetime.now(est)
@@ -1396,7 +1316,7 @@ def daily_reminder(msg_text, days_of_week=None):
         safe_send(chat_id, msg_text)
 
 def reminder_7am():
-    daily_reminder("Ginger shot time. Take it now. After this shot — work mode begins. No excuses.")
+    daily_reminder("Ginger shot time. Take it now. After this shot - work mode begins. No excuses.")
 
 def reminder_730am():
     daily_reminder("Eat before you leave. Eggs or yogurt. In your mouth before you walk out the door.")
@@ -1417,27 +1337,35 @@ def reminder_945pm():
     chat_id = get_last_chat_id()
     if not chat_id:
         return
-    # Check Notion — if expenses were already logged today, skip the nag
     try:
         logged_today = has_expense_today()
     except Exception:
-        logged_today = False  # fail open
+        logged_today = False
     if logged_today:
-        safe_send(chat_id, "Night ginger shot. Expenses already logged today — good work. Do your face routine, brush your teeth. Wind down begins now.")
+        safe_send(chat_id, "Night ginger shot. Expenses already logged today - good work. Do your face routine, brush your teeth. Wind down begins now.")
     else:
-        safe_send(chat_id, "Night ginger shot. Take it, do your face routine, brush your teeth. That is your signal — wind down begins now. Phone goes down after this.\n\nAlso: did you log your expenses today? Use /spent or send a receipt photo.")
+        safe_send(chat_id, "Night ginger shot. Take it, do your face routine, brush your teeth. That is your signal - wind down begins now. Phone goes down after this.\n\nAlso: did you log your expenses today? Use /spent or send a receipt photo.")
 
 def reminder_10pm():
     daily_reminder("Phone down. No screen. Read something. Tomorrow starts tonight.")
 
 def reminder_11am_win():
-    daily_reminder("Log a win — what went right today so far? Use /wins")
+    daily_reminder("Log a win - what went right today so far? Use /wins")
 
 def reminder_3pm_win():
-    daily_reminder("Quick one — anything worth logging as a win right now? Use /wins")
+    daily_reminder("Quick one - anything worth logging as a win right now? Use /wins")
 
 def reminder_8pm_win():
-    daily_reminder("Before you wind down — log today's wins with /wins")
+    daily_reminder("Before you wind down - log today's wins with /wins")
+
+def reminder_830am_meal():
+    daily_reminder("Log breakfast - don't forget your smoothie + Greek yogurt.")
+
+def reminder_130pm_meal():
+    daily_reminder("Log lunch.")
+
+def reminder_730pm_meal():
+    daily_reminder("Log dinner.")
 
 def reminder_830am_tasks():
     chat_id = get_last_chat_id()
@@ -1451,9 +1379,6 @@ def reminder_830am_tasks():
     else:
         safe_send(chat_id, "No open tasks. Add something with /addtask and make the day count.")
 
-# --- PART 4: HEALTH CHECK SERVER ---
-
-# In a Reserved VM deployment Replit injects PORT; fall back to 8099 for dev
 HEALTH_PORT = int(os.environ.get("PORT", 8099))
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -1464,17 +1389,14 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"WEFT OS alive")
 
     def log_message(self, format, *args):
-        pass  # suppress HTTP access logs
+        pass
 
 def run_health_server():
     server = HTTPServer(("0.0.0.0", HEALTH_PORT), HealthHandler)
     print(f"Health check server running on port {HEALTH_PORT}")
     server.serve_forever()
 
-# --- SCHEDULER SETUP ---
-
 def _utc(hour_et, minute_et=0):
-    """Convert an Eastern Time to a UTC HH:MM string. Returns (time_str, day_shifted)."""
     now_et = datetime.datetime.now(est)
     dt_et  = now_et.replace(hour=hour_et, minute=minute_et, second=0, microsecond=0)
     dt_utc = dt_et.astimezone(pytz.utc)
@@ -1497,13 +1419,15 @@ def run_scheduler():
     t_11am,   _       = _utc(11, 0)
     t_3pm,    _       = _utc(15, 0)
     t_8pm,    _       = _utc(20, 0)
+    t_830am_meal, _   = _utc(8, 30)
+    t_130pm,  _       = _utc(13, 30)
+    t_730pm,  _       = _utc(19, 30)
     t_mon8am, _       = _utc(8,  0)
     t_sat12,  _       = _utc(12, 0)
     t_sun15,  _       = _utc(15, 0)
     t_sun16,  _       = _utc(16, 0)
     t_reset,  shifted = _utc(21, 30)
 
-    # Daily reminders — scheduled in UTC
     schedule.every().day.at(t_7am).do(reminder_7am)
     schedule.every().day.at(t_730am).do(reminder_730am)
     schedule.every().day.at(t_8am).do(reminder_8am_gym)
@@ -1514,24 +1438,26 @@ def run_scheduler():
     schedule.every().day.at(t_7pm).do(reminder_7pm)
     schedule.every().day.at(t_945pm).do(reminder_945pm)
     schedule.every().day.at(t_10pm).do(reminder_10pm)
-    
+
     schedule.every().day.at(t_11am).do(reminder_11am_win)
     schedule.every().day.at(t_3pm).do(reminder_3pm_win)
     schedule.every().day.at(t_8pm).do(reminder_8pm_win)
 
-    # Weekly
+    schedule.every().day.at(t_830am_meal).do(reminder_830am_meal)
+    schedule.every().day.at(t_130pm).do(reminder_130pm_meal)
+    schedule.every().day.at(t_730pm).do(reminder_730pm_meal)
+
     schedule.every().monday.at(t_mon8am).do(send_weekly_email)
     schedule.every().saturday.at(t_sat12).do(ginger_batch_reminder)
     schedule.every().sunday.at(t_sun15).do(sunday_grocery_list)
     schedule.every().sunday.at(t_sun16).do(sunday_meal_prep_check)
-    # Sunday 9:30 PM ET can cross into Monday UTC — schedule on the correct UTC day
     if shifted:
         schedule.every().monday.at(t_reset).do(sunday_reset_reminder)
     else:
         schedule.every().sunday.at(t_reset).do(sunday_reset_reminder)
     reset_day_label = "Mon" if shifted else "Sun"
 
-    print(f"\nScheduler running — 16 jobs ({tz_name} = UTC{offset:+d})")
+    print(f"\nScheduler running - 19 jobs ({tz_name} = UTC{offset:+d})")
     print(f"  {t_7am} UTC  = 07:00 {tz_name}  Daily ginger shot")
     print(f"  {t_730am} UTC  = 07:30 {tz_name}  Eat breakfast")
     print(f"  {t_8am} UTC  = 08:00 {tz_name}  Gym / walk")
@@ -1544,6 +1470,9 @@ def run_scheduler():
     print(f"  {t_8pm} UTC  = 20:00 {tz_name}  Log a win (evening)")
     print(f"  {t_945pm} UTC  = 21:45 {tz_name}  Night ginger shot + expense check")
     print(f"  {t_10pm} UTC  = 22:00 {tz_name}  Phone down")
+    print(f"  {t_830am_meal} UTC  = 08:30 {tz_name}  Log breakfast")
+    print(f"  {t_130pm} UTC  = 13:30 {tz_name}  Log lunch")
+    print(f"  {t_730pm} UTC  = 19:30 {tz_name}  Log dinner")
     print(f"  Mon {t_mon8am} UTC  = Mon 08:00 {tz_name}  Weekly email")
     print(f"  Sat {t_sat12} UTC  = Sat 12:00 {tz_name}  Ginger batch")
     print(f"  Sun {t_sun15} UTC  = Sun 15:00 {tz_name}  Grocery list")
@@ -1557,34 +1486,29 @@ def run_scheduler():
             print(f"Scheduler job error: {e}")
         time.sleep(30)
 
-# --- WATCHDOG ---
-
 _poll_alive = threading.Event()
 
 def watchdog():
-    """Ping Telegram every 60 s. If unreachable, force a polling restart."""
     time.sleep(90)
     while True:
         time.sleep(60)
         try:
             bot.get_me()
         except Exception as e:
-            print(f"[WATCHDOG] Telegram unreachable: {e} — forcing polling restart")
+            print(f"[WATCHDOG] Telegram unreachable: {e} - forcing polling restart")
             try:
                 bot.stop_polling()
             except Exception:
                 pass
 
 def scheduler_supervisor():
-    """Run the scheduler in a loop — restart it if it ever crashes."""
     while True:
         try:
             run_scheduler()
         except Exception as e:
-            print(f"[SCHEDULER] Crashed: {e} — restarting in 10 s")
+            print(f"[SCHEDULER] Crashed: {e} - restarting in 10 s")
             time.sleep(10)
 
-# --- START ---
 print("WEFT OS starting...")
 
 health_thread = threading.Thread(target=run_health_server, daemon=True)
@@ -1606,7 +1530,7 @@ def send_startup_message():
             f"WEFT OS is live.\n"
             f"Timezone: Atlanta ({tz_name})\n"
             f"Current time: {now_et} ET\n"
-            f"13 jobs scheduled. Watchdog active.\n"
+            f"19 jobs scheduled. Watchdog active.\n"
             f"All reminders will fire at the correct Eastern Time."
         )
 
@@ -1615,26 +1539,26 @@ startup_msg_thread.start()
 
 def start_polling():
     first_boot = True
-    last_recovery_sent = 0  # epoch seconds; 0 = never sent
-    recovery_cooldown = 600  # 10 minutes
+    last_recovery_sent = 0
+    recovery_cooldown = 600
 
     while True:
         try:
             if not first_boot:
                 now = time.time()
                 if now - last_recovery_sent >= recovery_cooldown:
-                    print("[POLLING] Restarting after crash — sending recovery message")
+                    print("[POLLING] Restarting after crash - sending recovery message")
                     chat_id = get_last_chat_id()
                     if chat_id:
                         safe_send(chat_id, "WEFT OS is back online.")
                     last_recovery_sent = now
                 else:
-                    print("[POLLING] Restarting (within cooldown — no message sent)")
+                    print("[POLLING] Restarting (within cooldown - no message sent)")
             first_boot = False
             print("[POLLING] Started.")
             bot.infinity_polling(timeout=60, long_polling_timeout=60)
         except Exception as e:
-            print(f"[POLLING] Error: {e} — retrying in 5 s")
+            print(f"[POLLING] Error: {e} - retrying in 5 s")
             time.sleep(5)
 
 start_polling()
