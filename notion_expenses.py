@@ -299,3 +299,144 @@ def mark_tasks_done_in_notion(page_ids):
             print(f"Error marking task {page_id} done: {e}")
             
     return success_count
+
+# --- NOTION FOOD (PANTRY & MEALS) ---
+
+NOTION_FOOD_DB_ID = "39575f5d-f642-81d1-9eb5-e3282247795f"
+
+def write_food_to_notion(item_name, item_type, qty=None, unit=None, meal_type=None, status=None, image_url=None):
+    """Write a new food record (Pantry or Meal Log) to the WEFT Food Notion database."""
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28",
+    }
+    date_str = datetime.datetime.now(pytz.timezone('US/Eastern')).strftime("%Y-%m-%d")
+    
+    properties = {
+        "Item": {"title": [{"text": {"content": item_name}}]},
+        "Type": {"select": {"name": item_type}}
+    }
+    
+    if qty is not None:
+        properties["Quantity"] = {"number": float(qty)}
+    if unit:
+        properties["Unit"] = {"rich_text": [{"text": {"content": unit}}]}
+        
+    if item_type == "Pantry":
+        properties["Date Added"] = {"date": {"start": date_str}}
+        properties["Status"] = {"select": {"name": status or "In Stock"}}
+    elif item_type == "Meal Log":
+        properties["Date Consumed"] = {"date": {"start": date_str}}
+        if meal_type:
+            properties["Meal Type"] = {"select": {"name": meal_type}}
+            
+    if image_url:
+        properties["Receipt Photo"] = {"files": [{"type": "external", "name": "photo.jpg", "external": {"url": image_url}}]}
+        
+    payload = {
+        "parent": {"database_id": NOTION_FOOD_DB_ID},
+        "properties": properties
+    }
+    
+    try:
+        response = requests.post("https://api.notion.com/v1/pages", headers=headers, json=payload, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        print(f"Error writing food to Notion: {e}")
+        return None
+
+def get_pantry_from_notion():
+    """Retrieve all Pantry items where Status != Out, returning list of dicts."""
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28",
+    }
+    
+    payload = {
+        "filter": {
+            "and": [
+                {"property": "Type", "select": {"equals": "Pantry"}},
+                {"property": "Status", "select": {"does_not_equal": "Out"}}
+            ]
+        }
+    }
+    
+    items = []
+    try:
+        response = requests.post(f"https://api.notion.com/v1/databases/{NOTION_FOOD_DB_ID}/query", headers=headers, json=payload, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        
+        for item in data.get("results", []):
+            props = item.get("properties", {})
+            
+            title_prop = props.get("Item", {}).get("title", [])
+            name = title_prop[0].get("plain_text", "") if title_prop else ""
+            
+            qty = props.get("Quantity", {}).get("number")
+            
+            unit_prop = props.get("Unit", {}).get("rich_text", [])
+            unit = unit_prop[0].get("plain_text", "") if unit_prop else ""
+            
+            status_prop = props.get("Status", {}).get("select")
+            status = status_prop.get("name") if status_prop else "In Stock"
+            
+            if name:
+                items.append({
+                    "id": item["id"],
+                    "name": name,
+                    "qty": qty,
+                    "unit": unit,
+                    "status": status
+                })
+                
+        return items
+    except Exception as e:
+        print(f"Error retrieving pantry from Notion: {e}")
+        return []
+
+def update_pantry_item_in_notion(page_id, new_qty, new_status):
+    """Update quantity and status of a pantry item."""
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28",
+    }
+    
+    properties = {}
+    if new_qty is not None:
+        properties["Quantity"] = {"number": float(new_qty)}
+    if new_status:
+        properties["Status"] = {"select": {"name": new_status}}
+        
+    if not properties:
+        return False
+        
+    try:
+        payload = {"properties": properties}
+        response = requests.patch(f"https://api.notion.com/v1/pages/{page_id}", headers=headers, json=payload, timeout=10)
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"Error updating pantry item {page_id}: {e}")
+        return False
+
+def attach_photo_to_notion_page(page_id, image_url):
+    """Attach an external image URL to the Receipt Photo property of a specific page."""
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28",
+    }
+    properties = {
+        "Receipt Photo": {"files": [{"type": "external", "name": "photo.jpg", "external": {"url": image_url}}]}
+    }
+    try:
+        requests.patch(f"https://api.notion.com/v1/pages/{page_id}", headers=headers, json={"properties": properties}, timeout=10)
+        return True
+    except Exception as e:
+        print(f"Error attaching photo to {page_id}: {e}")
+        return False
