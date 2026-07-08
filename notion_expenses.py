@@ -3,10 +3,11 @@ import json
 import datetime
 import pytz
 import base64
+import os
 import re
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-NOTION_TOKEN = "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"
+NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 NOTION_DB_ID = "39575f5d-f642-810e-854e-c80528128539"
 
 CATEGORIES = [
@@ -149,20 +150,22 @@ def clear_state(chat_id):
     if chat_id in expense_states:
         del expense_states[chat_id]
 
-def upload_file_to_notion_or_imgur(img_data):
+def upload_file_to_notion_or_imgur(img_data, upload_to_drive=None):
     """
-    Notion API doesn't support direct file uploads via the public API for the 'files' property.
-    We must provide an external URL. We'll use a free image host like Imgur for this bot.
+    Notion API doesn't support direct file uploads via the public API for the 'files' property,
+    so we need an external URL. Receipts are uploaded to Google Drive (private, already
+    connected via Composio) instead of public Imgur.
+
+    `upload_to_drive` is injected from main.py to avoid a circular import; it takes raw
+    image bytes and returns a shareable Drive URL (or None on failure).
     """
+    if upload_to_drive is None:
+        print("Error uploading image: no Drive uploader provided.")
+        return None
     try:
-        # Using a public client ID for Imgur anonymous uploads (temporary solution)
-        headers = {"Authorization": "Client-ID 8a93649479261cb"}
-        payload = {"image": base64.b64encode(img_data).decode("utf-8")}
-        response = requests.post("https://api.imgur.com/3/image", headers=headers, data=payload, timeout=15)
-        if response.status_code == 200:
-            return response.json()["data"]["link"]
+        return upload_to_drive(img_data)
     except Exception as e:
-        print(f"Error uploading image: {e}")
+        print(f"Error uploading image to Drive: {e}")
     return None
 
 def has_expense_today():

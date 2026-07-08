@@ -9,7 +9,6 @@ import random
 import time
 import threading
 import base64
-import schedule
 import anthropic
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -45,7 +44,16 @@ est = pytz.timezone('US/Eastern')
 user_state = {}
 LAST_CHAT_ID_FILE = "/tmp/last_chat_id.txt"
 
+# Owner chat ID from env so reminders survive restarts/redeploys.
+# Set OWNER_CHAT_ID in Railway env vars. Falls back to last-chat-id file if unset.
+OWNER_CHAT_ID = os.environ.get("OWNER_CHAT_ID", "").strip()
+
 def get_last_chat_id():
+    if OWNER_CHAT_ID:
+        try:
+            return int(OWNER_CHAT_ID)
+        except ValueError:
+            print(f"[CONFIG] OWNER_CHAT_ID is not a valid integer: {OWNER_CHAT_ID!r}")
     if os.path.exists(LAST_CHAT_ID_FILE):
         with open(LAST_CHAT_ID_FILE, "r") as f:
             content = f.read().strip()
@@ -134,6 +142,73 @@ def sheets_append(sheet_name, values):
     drive_backup(sheet_name, values)
     return result
 
+def sheets_append_ok(result):
+    """True only when the append genuinely succeeded: no error key anywhere
+    and the expected response shape is present."""
+    if not isinstance(result, dict):
+        return False
+    if "error" in result:
+        return False
+    # Webhook path returns its own shape; treat explicit ok/status flags as authoritative.
+    if result.get("ok") is False or result.get("status") == "error":
+        return False
+    data = result.get("data")
+    if isinstance(data, dict) and "error" in data:
+        return False
+    # Expected shapes: Composio proxy -> {'data': {...}}, webhook -> {'ok': True} / {'updates': ...}
+    return ("data" in result) or (result.get("ok") is True) or ("updates" in result)
+
+def upload_receipt_to_drive(img_data):
+    """Upload a receipt photo to the WEFT Studios Google Drive folder via Composio
+    and return a shareable link, or None on failure."""
+    try:
+        folder_id = _get_weft_studios_folder_id()
+        file_name = f"receipt_{datetime.datetime.now(est).strftime('%Y%m%d_%H%M%S')}.jpg"
+        metadata = {"name": file_name, "mimeType": "image/jpeg"}
+        if folder_id:
+            metadata["parents"] = [folder_id]
+
+        boundary = "weft_upload_boundary"
+        body = (
+            f"--{boundary}\r\n"
+            "Content-Type: application/json; charset=UTF-8\r\n\r\n"
+            f"{json.dumps(metadata)}\r\n"
+            f"--{boundary}\r\n"
+            "Content-Type: image/jpeg\r\n"
+            "Content-Transfer-Encoding: base64\r\n\r\n"
+            f"{base64.b64encode(img_data).decode('utf-8')}\r\n"
+            f"--{boundary}--"
+        )
+
+        url = "https://backend.composio.dev/api/v3.1/tools/execute/proxy"
+        payload = {
+            "connected_account_id": DRIVE_CONNECTION_ID,
+            "endpoint": "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink,webContentLink",
+            "method": "POST",
+            "body": body,
+            "headers": {"Content-Type": f"multipart/related; boundary={boundary}"}
+        }
+        headers = {"x-api-key": COMPOSIO_API_KEY, "Content-Type": "application/json"}
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        res = response.json()
+        file_data = res.get("data", {})
+        file_id = file_data.get("id")
+        if not file_id:
+            print(f"Drive receipt upload failed: {res}")
+            return None
+
+        # Make the file link-shareable so Notion can render it.
+        execute_proxy(
+            f"https://www.googleapis.com/drive/v3/files/{file_id}/permissions",
+            method="POST",
+            body={"role": "reader", "type": "anyone"},
+            connection_id=DRIVE_CONNECTION_ID
+        )
+        return file_data.get("webContentLink") or f"https://drive.google.com/uc?id={file_id}"
+    except Exception as e:
+        print(f"Drive receipt upload error: {e}")
+        return None
+
 def sheets_get(sheet_name, range_notation="A:E"):
     if SHEETS_WEBHOOK_URL:
         result = _webhook_post("read", sheet_name)
@@ -178,7 +253,7 @@ def handle_photo(message, caption=None):
         file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
         img_data = requests.get(file_url, timeout=15).content
 
-        image_url = upload_file_to_notion_or_imgur(img_data)
+        image_url = upload_file_to_notion_or_imgur(img_data, upload_to_drive=upload_receipt_to_drive)
 
         if image_url:
             success = attach_photo_to_notion_page(target_page_id, image_url)
@@ -381,7 +456,8 @@ def morning_briefing(message):
 
     now_dt = datetime.datetime.now(est)
     start_of_day = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-    time_min = start_of_day.strftime("%Y-%m-%dT%H:%M:%S-05:00")
+    # Use the actual ET offset (handles EST -05:00 vs EDT -04:00 automatically)
+    time_min = start_of_day.isoformat()
     cal_res = execute_proxy(f"https://www.googleapis.com/calendar/v3/calendars/primary/events?timeMin={time_min}&maxResults=5&singleEvents=true&orderBy=startTime")
     events = []
     if 'data' in cal_res and 'items' in cal_res.get('data', {}):
@@ -681,10 +757,10 @@ def log_income(message):
 
     date = datetime.datetime.now(est).strftime("%Y-%m-%d")
     res = sheets_append("Sheet1", [[date, source, item, amount, "Logged via bot"]])
-    if 'data' in res or 'error' not in res:
+    if sheets_append_ok(res):
         safe_send(message.chat.id, f"Logged - {source} ${amount} for {item} on {date}")
     else:
-        safe_send(message.chat.id, f"Error logging income: {res.get('error', 'unknown')}")
+        safe_send(message.chat.id, f"Error logging income: {res.get('error', 'unknown') if isinstance(res, dict) else 'unknown'}")
 
 @bot.message_handler(commands=['weekcheck'])
 def week_check(message):
@@ -743,7 +819,7 @@ def log_subscription(message):
         date_str = match.group(3).strip()
         date = datetime.datetime.now(est).strftime("%Y-%m-%d")
         res = sheets_append("Subscriptions", [[name, amount, date, "", date_str]])
-        if 'data' in res or 'error' not in res:
+        if sheets_append_ok(res):
             safe_send(message.chat.id, f"Logged subscription: {name} ${amount}")
         else:
             safe_send(message.chat.id, "Error logging subscription.")
@@ -1130,8 +1206,8 @@ def ginger_night(message):
 @bot.message_handler(func=lambda message: True)
 def handle_text(message):
     set_last_chat_id(message.chat.id)
-    text = message.text.lower()
-    if any(word in text for word in ['hi', 'hello', 'hey', 'sup', 'yo']):
+    words = set(re.findall(r"[a-z']+", message.text.lower()))
+    if words & {'hi', 'hello', 'hey', 'sup', 'yo'}:
         safe_send(message.chat.id, "WEFT OS online. Type /help to see all commands.")
     else:
         safe_send(message.chat.id, "Type /help to see all commands.")
@@ -1194,8 +1270,21 @@ def send_weekly_email():
             if len(row) > 0 and row[0] >= week_start:
                 food_days.add(row[0])
 
-    launch_date = datetime.datetime(2025, 9, 1, tzinfo=est)
-    days_left = (launch_date - now).days
+    # Drop 001 target date - set DROP_001_DATE in Railway env vars (YYYY-MM-DD).
+    # Waiting on Keem's confirmed date; until then the countdown line is skipped
+    # instead of showing a negative number.
+    launch_line = "Keep going Keem."
+    drop_date_str = os.environ.get("DROP_001_DATE", "").strip()
+    if drop_date_str:
+        try:
+            launch_date = est.localize(datetime.datetime.strptime(drop_date_str, "%Y-%m-%d"))
+            days_left = (launch_date - now).days
+            if days_left >= 0:
+                launch_line = f"Drop 001 launches in {days_left} days. Keep going Keem."
+            else:
+                launch_line = f"Drop 001 launched {abs(days_left)} days ago. Keep the momentum, Keem."
+        except ValueError:
+            print(f"[CONFIG] DROP_001_DATE is not YYYY-MM-DD: {drop_date_str!r}")
 
     net = total_income - total_spent
 
@@ -1215,7 +1304,7 @@ def send_weekly_email():
         f"HABITS\n"
         f"Wins logged: {wins_count} days\n"
         f"Food logged: {len(food_days)} days\n\n"
-        f"Drop 001 launches in {days_left} days. Keep going Keem."
+        f"{launch_line}"
     )
 
     subject = f"WEFT Weekly Report - {today_str}"
@@ -1396,95 +1485,68 @@ def run_health_server():
     print(f"Health check server running on port {HEALTH_PORT}")
     server.serve_forever()
 
-def _utc(hour_et, minute_et=0):
-    now_et = datetime.datetime.now(est)
-    dt_et  = now_et.replace(hour=hour_et, minute=minute_et, second=0, microsecond=0)
-    dt_utc = dt_et.astimezone(pytz.utc)
-    shifted = dt_utc.date() > dt_et.date()
-    return dt_utc.strftime("%H:%M"), shifted
+# DST-safe scheduler: jobs are defined as Eastern wall-clock times and matched
+# against the *current* ET time every minute, so a DST switch never causes drift
+# and no restart is required. (Fixes the old approach of converting ET->UTC once
+# at boot.)
+ET_JOBS = [
+    # (day: None=every day, or weekday name, "HH:MM" ET, function, label)
+    (None,       "07:00", reminder_7am,          "Daily ginger shot"),
+    (None,       "07:30", reminder_730am,        "Eat breakfast"),
+    (None,       "08:00", reminder_8am_gym,      "Gym"),
+    (None,       "08:00", reminder_8am_rest,     "Rest walk"),
+    (None,       "08:30", reminder_830am_tasks,  "Top 3 tasks"),
+    (None,       "08:30", reminder_830am_meal,   "Log breakfast"),
+    (None,       "09:00", check_subscriptions,   "Subscription check"),
+    (None,       "11:00", reminder_11am_win,     "Log a win (morning)"),
+    (None,       "13:00", reminder_1pm,          "Lunch"),
+    (None,       "13:30", reminder_130pm_meal,   "Log lunch"),
+    (None,       "15:00", reminder_3pm_win,      "Log a win (afternoon)"),
+    (None,       "19:00", reminder_7pm,          "Dinner"),
+    (None,       "19:30", reminder_730pm_meal,   "Log dinner"),
+    (None,       "20:00", reminder_8pm_win,      "Log a win (evening)"),
+    (None,       "21:45", reminder_945pm,        "Night ginger + expense check"),
+    (None,       "22:00", reminder_10pm,         "Phone down"),
+    ("Monday",   "08:00", send_weekly_email,     "Weekly email"),
+    ("Saturday", "12:00", ginger_batch_reminder, "Ginger batch"),
+    ("Sunday",   "15:00", sunday_grocery_list,   "Grocery list"),
+    ("Sunday",   "16:00", sunday_meal_prep_check, "Meal prep check"),
+    ("Sunday",   "21:30", sunday_reset_reminder, "Sunday reset"),
+]
 
 def run_scheduler():
     tz_name = datetime.datetime.now(est).strftime("%Z")
-    offset  = int(datetime.datetime.now(est).utcoffset().total_seconds() / 3600)
+    print(f"\nScheduler running - {len(ET_JOBS)} jobs, ET wall-clock matching ({tz_name}, DST-safe)")
+    for day, hhmm, _fn, label in ET_JOBS:
+        day_label = day or "Daily"
+        print(f"  {day_label:<9} {hhmm} ET  {label}")
 
-    t_7am,    _       = _utc(7,  0)
-    t_730am,  _       = _utc(7, 30)
-    t_8am,    _       = _utc(8,  0)
-    t_830am,  _       = _utc(8, 30)
-    t_9am,    _       = _utc(9,  0)
-    t_1pm,    _       = _utc(13, 0)
-    t_7pm,    _       = _utc(19, 0)
-    t_945pm,  _       = _utc(21, 45)
-    t_10pm,   _       = _utc(22, 0)
-    t_11am,   _       = _utc(11, 0)
-    t_3pm,    _       = _utc(15, 0)
-    t_8pm,    _       = _utc(20, 0)
-    t_830am_meal, _   = _utc(8, 30)
-    t_130pm,  _       = _utc(13, 30)
-    t_730pm,  _       = _utc(19, 30)
-    t_mon8am, _       = _utc(8,  0)
-    t_sat12,  _       = _utc(12, 0)
-    t_sun15,  _       = _utc(15, 0)
-    t_sun16,  _       = _utc(16, 0)
-    t_reset,  shifted = _utc(21, 30)
-
-    schedule.every().day.at(t_7am).do(reminder_7am)
-    schedule.every().day.at(t_730am).do(reminder_730am)
-    schedule.every().day.at(t_8am).do(reminder_8am_gym)
-    schedule.every().day.at(t_8am).do(reminder_8am_rest)
-    schedule.every().day.at(t_830am).do(reminder_830am_tasks)
-    schedule.every().day.at(t_9am).do(check_subscriptions)
-    schedule.every().day.at(t_1pm).do(reminder_1pm)
-    schedule.every().day.at(t_7pm).do(reminder_7pm)
-    schedule.every().day.at(t_945pm).do(reminder_945pm)
-    schedule.every().day.at(t_10pm).do(reminder_10pm)
-
-    schedule.every().day.at(t_11am).do(reminder_11am_win)
-    schedule.every().day.at(t_3pm).do(reminder_3pm_win)
-    schedule.every().day.at(t_8pm).do(reminder_8pm_win)
-
-    schedule.every().day.at(t_830am_meal).do(reminder_830am_meal)
-    schedule.every().day.at(t_130pm).do(reminder_130pm_meal)
-    schedule.every().day.at(t_730pm).do(reminder_730pm_meal)
-
-    schedule.every().monday.at(t_mon8am).do(send_weekly_email)
-    schedule.every().saturday.at(t_sat12).do(ginger_batch_reminder)
-    schedule.every().sunday.at(t_sun15).do(sunday_grocery_list)
-    schedule.every().sunday.at(t_sun16).do(sunday_meal_prep_check)
-    if shifted:
-        schedule.every().monday.at(t_reset).do(sunday_reset_reminder)
-    else:
-        schedule.every().sunday.at(t_reset).do(sunday_reset_reminder)
-    reset_day_label = "Mon" if shifted else "Sun"
-
-    print(f"\nScheduler running - 19 jobs ({tz_name} = UTC{offset:+d})")
-    print(f"  {t_7am} UTC  = 07:00 {tz_name}  Daily ginger shot")
-    print(f"  {t_730am} UTC  = 07:30 {tz_name}  Eat breakfast")
-    print(f"  {t_8am} UTC  = 08:00 {tz_name}  Gym / walk")
-    print(f"  {t_830am} UTC  = 08:30 {tz_name}  Top 3 tasks")
-    print(f"  {t_9am} UTC  = 09:00 {tz_name}  Subscription check")
-    print(f"  {t_11am} UTC  = 11:00 {tz_name}  Log a win (morning)")
-    print(f"  {t_1pm} UTC  = 13:00 {tz_name}  Lunch")
-    print(f"  {t_3pm} UTC  = 15:00 {tz_name}  Log a win (afternoon)")
-    print(f"  {t_7pm} UTC  = 19:00 {tz_name}  Dinner")
-    print(f"  {t_8pm} UTC  = 20:00 {tz_name}  Log a win (evening)")
-    print(f"  {t_945pm} UTC  = 21:45 {tz_name}  Night ginger shot + expense check")
-    print(f"  {t_10pm} UTC  = 22:00 {tz_name}  Phone down")
-    print(f"  {t_830am_meal} UTC  = 08:30 {tz_name}  Log breakfast")
-    print(f"  {t_130pm} UTC  = 13:30 {tz_name}  Log lunch")
-    print(f"  {t_730pm} UTC  = 19:30 {tz_name}  Log dinner")
-    print(f"  Mon {t_mon8am} UTC  = Mon 08:00 {tz_name}  Weekly email")
-    print(f"  Sat {t_sat12} UTC  = Sat 12:00 {tz_name}  Ginger batch")
-    print(f"  Sun {t_sun15} UTC  = Sun 15:00 {tz_name}  Grocery list")
-    print(f"  Sun {t_sun16} UTC  = Sun 16:00 {tz_name}  Meal prep check")
-    print(f"  {reset_day_label} {t_reset} UTC  = Sun 21:30 {tz_name}  Sunday reset")
-
+    last_fired = {}  # (index, date_str) -> True, so each job fires once per day
     while True:
         try:
-            schedule.run_pending()
+            now_et = datetime.datetime.now(est)
+            current_hhmm = now_et.strftime("%H:%M")
+            current_day = now_et.strftime("%A")
+            date_str = now_et.strftime("%Y-%m-%d")
+            for i, (day, hhmm, fn, label) in enumerate(ET_JOBS):
+                if hhmm != current_hhmm:
+                    continue
+                if day is not None and day != current_day:
+                    continue
+                key = (i, date_str)
+                if key in last_fired:
+                    continue
+                last_fired[key] = True
+                try:
+                    fn()
+                except Exception as e:
+                    print(f"Scheduler job error ({label}): {e}")
+            # Prune old entries so memory doesn't grow forever
+            if len(last_fired) > 200:
+                last_fired = {k: v for k, v in last_fired.items() if k[1] == date_str}
         except Exception as e:
-            print(f"Scheduler job error: {e}")
-        time.sleep(30)
+            print(f"Scheduler loop error: {e}")
+        time.sleep(20)
 
 _poll_alive = threading.Event()
 
@@ -1519,23 +1581,6 @@ scheduler_thread.start()
 
 watchdog_thread = threading.Thread(target=watchdog, daemon=True)
 watchdog_thread.start()
-
-def send_startup_message():
-    time.sleep(4)
-    chat_id = get_last_chat_id()
-    if chat_id:
-        tz_name = datetime.datetime.now(est).strftime("%Z")
-        now_et  = datetime.datetime.now(est).strftime("%I:%M %p")
-        safe_send(chat_id,
-            f"WEFT OS is live.\n"
-            f"Timezone: Atlanta ({tz_name})\n"
-            f"Current time: {now_et} ET\n"
-            f"19 jobs scheduled. Watchdog active.\n"
-            f"All reminders will fire at the correct Eastern Time."
-        )
-
-startup_msg_thread = threading.Thread(target=send_startup_message, daemon=True)
-startup_msg_thread.start()
 
 def start_polling():
     first_boot = True
