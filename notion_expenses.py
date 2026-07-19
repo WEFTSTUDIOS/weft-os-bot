@@ -221,12 +221,20 @@ def write_task_to_notion(task_name, priority=None):
     return _notion_request("POST", "https://api.notion.com/v1/pages", body=payload, timeout=10)
 
 def get_open_tasks_from_notion():
-    """Retrieve all open tasks (Status = To Do) from Notion, returning list of dicts."""
+    """Retrieve all open REGULAR tasks (Status = To Do, not Flash) from Notion.
+    Flash reminders live in the same database but are listed via flash_tasks."""
     payload = {
-        "filter": {"property": "Status", "select": {"equals": "To Do"}},
+        "filter": {"and": [
+            {"property": "Status", "select": {"equals": "To Do"}},
+            {"property": "Type", "select": {"does_not_equal": "Flash"}}
+        ]},
         "sorts": [{"property": "Date Added", "direction": "ascending"}]
     }
     data = _notion_request("POST", f"https://api.notion.com/v1/databases/{NOTION_TASKS_DB_ID}/query", body=payload)
+    if not data:
+        # First boot before the Type property exists: fall back to the plain filter.
+        payload["filter"] = {"property": "Status", "select": {"equals": "To Do"}}
+        data = _notion_request("POST", f"https://api.notion.com/v1/databases/{NOTION_TASKS_DB_ID}/query", body=payload)
     tasks = []
     if not data:
         return tasks
